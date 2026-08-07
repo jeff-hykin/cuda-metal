@@ -32,6 +32,12 @@ struct LowerToLlvmResult {
 LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx,
                                        const LowerToLlvmOptions& options = {});
 
+// Return the runtime-written __constant__ symbols the named entry reads, in the order of the
+// hidden constant-buffer arguments the lowering appends. Derived from the PTX alone so the launch
+// path can bind them even when a cached metallib made lowering unnecessary.
+std::vector<std::string> runtime_const_symbols_for_entry(std::string_view ptx,
+                                                         std::string_view entry_name);
+
 // Return the total bytes of static __shared__ memory required by the PTX.
 // This is needed to call setThreadgroupMemoryLength at kernel launch time.
 std::size_t compute_static_shared_bytes(std::string_view ptx,

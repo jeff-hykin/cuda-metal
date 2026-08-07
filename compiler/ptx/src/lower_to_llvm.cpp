@@ -353,6 +353,17 @@ struct ConstSymbolInfo {
     std::size_t byte_count = 0;
 };
 
+// A `__constant__` or `__device__` variable declared without an initializer, i.e. one whose contents
+// are written at runtime via cudaMemcpyToSymbol. There is no compile-time value to inline, so it
+// becomes a hidden kernel argument that the launch path binds to the symbol's device storage.
+struct RuntimeConstSymbolInfo {
+    std::size_t byte_count = 0;
+    int align = 1;
+    // `__device__` globals land in `.global` and kernels may write them, so they need the device
+    // address space rather than the read-only constant one.
+    bool device_space = false;
+};
+
 struct SharedSymbolInfo {
     std::size_t offset_bytes = 0;  // byte offset within the threadgroup buffer
     std::size_t size_bytes   = 0;  // size of this symbol in bytes
@@ -456,6 +467,99 @@ std::vector<ParsedConstB8Array> parse_ptx_const_b8_arrays(std::string_view ptx_t
     }
 
     return out;
+}
+
+// Collect module-scope arrays declared without an initializer list, e.g.
+//   .visible .const .align 4 .b8 dsp_kernel_const[28];
+//   .visible .global .align 4 .b8 gauss_coeffs[324];
+// which is what clang emits for `__constant__ float dsp_kernel_const[7];` and
+// `__device__ float gauss_coeffs[81];`.
+std::unordered_map<std::string, RuntimeConstSymbolInfo> parse_ptx_runtime_const_arrays(
+    std::string_view ptx_text) {
+    std::unordered_map<std::string, RuntimeConstSymbolInfo> out;
+    std::istringstream lines{std::string(ptx_text)};
+    std::string line;
+    while (std::getline(lines, line)) {
+        const std::string t = trim(line);
+        const bool device_space = t.find(".global") != std::string::npos;
+        if ((t.find(".const") == std::string::npos && !device_space) ||
+            t.find(".b8") == std::string::npos) {
+            continue;
+        }
+        // Declarations with an initializer are compile-time constants and are handled by
+        // parse_ptx_const_b8_arrays; a `.param` line is a by-value aggregate, not a symbol.
+        if (t.find('{') != std::string::npos || t.find(".param") != std::string::npos) {
+            continue;
+        }
+
+        int align = 1;
+        if (const std::size_t align_pos = t.find(".align"); align_pos != std::string::npos) {
+            std::size_t pos = align_pos + 6;
+            while (pos < t.size() && std::isspace(static_cast<unsigned char>(t[pos])) != 0) ++pos;
+            std::size_t end = pos;
+            while (end < t.size() && std::isdigit(static_cast<unsigned char>(t[end])) != 0) ++end;
+            if (end > pos) {
+                try {
+                    align = std::max(1, std::stoi(t.substr(pos, end - pos)));
+                } catch (...) {
+                    align = 1;
+                }
+            }
+        }
+
+        std::size_t sym_begin = t.find(".b8") + 3;
+        while (sym_begin < t.size() && std::isspace(static_cast<unsigned char>(t[sym_begin])) != 0) ++sym_begin;
+        const std::size_t bracket_open = t.find('[', sym_begin);
+        const std::size_t bracket_close =
+            (bracket_open == std::string::npos) ? std::string::npos : t.find(']', bracket_open + 1);
+        if (bracket_open == std::string::npos || bracket_close == std::string::npos) {
+            continue;
+        }
+        const std::string symbol = trim(t.substr(sym_begin, bracket_open - sym_begin));
+        if (symbol.empty()) {
+            continue;
+        }
+        std::size_t declared_count = 0;
+        try {
+            declared_count = static_cast<std::size_t>(
+                std::stoull(trim(t.substr(bracket_open + 1, bracket_close - bracket_open - 1))));
+        } catch (...) {
+            continue;
+        }
+        if (declared_count == 0) {
+            continue;
+        }
+        out.emplace(symbol, RuntimeConstSymbolInfo{
+                                .byte_count = declared_count, .align = align, .device_space = device_space});
+    }
+
+    return out;
+}
+
+// The runtime-written __constant__ symbols an entry actually reads, in first-reference order.
+// This ordering defines the hidden constant-buffer arguments appended to the kernel, so the launch
+// path derives the same list straight from the PTX rather than depending on lowering having run
+// (a warm JIT cache skips lowering entirely).
+std::vector<std::string> collect_runtime_const_references(
+    const cumetal::ptx::EntryFunction& entry,
+    const std::unordered_map<std::string, RuntimeConstSymbolInfo>& runtime_consts) {
+    std::vector<std::string> order;
+    std::unordered_set<std::string> seen;
+    for (const auto& instr : entry.instructions) {
+        for (const std::string& operand : instr.operands) {
+            std::string token = trim(operand);
+            if (!token.empty() && token.front() == '[') {
+                token = token.substr(1);
+            }
+            token = trim(token.substr(0, token.find_first_of("]+-")));
+            if (token.empty() || runtime_consts.find(token) == runtime_consts.end() ||
+                !seen.insert(token).second) {
+                continue;
+            }
+            order.push_back(token);
+        }
+    }
+    return order;
 }
 
 // Extract the body text (between the outermost braces) of the named .entry.
@@ -664,8 +768,9 @@ std::unordered_map<std::string, SharedSymbolInfo> parse_ptx_shared_symbols(
         seen.insert(symbol);
 
         // All extern shared declarations alias the launch-provided dynamic
-        // threadgroup allocation. Pointer arithmetic in the kernel selects
-        // sub-regions, so their symbolic base is exactly byte offset zero.
+        // threadgroup allocation, which CUDA places immediately after the
+        // kernel's static __shared__ objects. Their common base is resolved
+        // once the static layout below is known.
         if (is_extern) {
             extern_symbols.push_back(symbol);
             continue;
@@ -695,8 +800,11 @@ std::unordered_map<std::string, SharedSymbolInfo> parse_ptx_shared_symbols(
         out.emplace(sym, SharedSymbolInfo{.offset_bytes = cursor, .size_bytes = e.size_bytes});
         cursor += e.size_bytes;
     }
+    // Dynamic shared memory starts after the static objects, on the 16-byte boundary CUDA
+    // guarantees for it. Size stays zero: only the launch knows how much was requested.
+    const std::size_t dynamic_base = (cursor + 15) & ~static_cast<std::size_t>(15);
     for (const std::string& sym : extern_symbols) {
-        out.emplace(sym, SharedSymbolInfo{.offset_bytes = 0, .size_bytes = 0});
+        out.emplace(sym, SharedSymbolInfo{.offset_bytes = dynamic_base, .size_bytes = 0});
     }
     return out;
 }
@@ -912,10 +1020,12 @@ class GenericLlvmEmitter {
                       std::vector<ParamInfo>* params,
                       std::vector<std::string>* arg_decls,
                       const std::unordered_map<std::string, ConstSymbolInfo>* const_symbols,
+                      const std::unordered_map<std::string, RuntimeConstSymbolInfo>* runtime_const_symbols,
                       const std::unordered_map<std::string, SharedSymbolInfo>* shared_symbols,
                       const std::unordered_map<std::string, LocalDepotInfo>* local_depots,
                       cumetal::ptx::Fp64Mode fp64_mode = cumetal::ptx::Fp64Mode::kNative)
         : entry_(entry), params_(params), arg_decls_(arg_decls), const_symbols_(const_symbols),
+          runtime_const_symbols_(runtime_const_symbols),
           shared_symbols_(shared_symbols), local_depots_(local_depots), fp64_mode_(fp64_mode) {
         if (params_ != nullptr) {
             for (std::size_t i = 0; i < params_->size(); ++i) {
@@ -935,6 +1045,10 @@ class GenericLlvmEmitter {
         GenericLlvmBodyResult result;
         if (params_ == nullptr || arg_decls_ == nullptr) {
             result.error = "internal error: missing param vectors";
+            return result;
+        }
+        if (!append_runtime_const_params()) {
+            result.error = error_;
             return result;
         }
         if (!append_required_builtin_params()) {
@@ -1008,6 +1122,10 @@ class GenericLlvmEmitter {
     std::vector<ParamInfo>* params_ = nullptr;
     std::vector<std::string>* arg_decls_ = nullptr;
     const std::unordered_map<std::string, ConstSymbolInfo>* const_symbols_ = nullptr;
+    const std::unordered_map<std::string, RuntimeConstSymbolInfo>* runtime_const_symbols_ = nullptr;
+    std::unordered_map<std::string, std::string> runtime_const_arg_name_;
+    std::unordered_map<std::string, std::string> runtime_const_arg_type_;
+    std::vector<std::string> runtime_const_order_;
     const std::unordered_map<std::string, SharedSymbolInfo>* shared_symbols_ = nullptr;
     const std::unordered_map<std::string, LocalDepotInfo>* local_depots_ = nullptr;
     cumetal::ptx::Fp64Mode fp64_mode_ = cumetal::ptx::Fp64Mode::kNative;
@@ -1027,7 +1145,6 @@ class GenericLlvmEmitter {
     std::unordered_map<std::string, RegSlot> reg_slots_;
     std::unordered_map<std::string, PointerAs> reg_pointer_as_;
     std::unordered_map<std::string, LocalSymbolInfo> local_symbols_;
-    std::unordered_map<std::string, int> call_param_bits_;
     std::unordered_map<std::string, std::string> call_param_slots_;
 
     std::unordered_set<std::string> declarations_;
@@ -1497,6 +1614,30 @@ class GenericLlvmEmitter {
         return true;
     }
 
+    // Give every runtime-written __constant__ symbol the kernel references a hidden
+    // constant-buffer argument. These must land before the builtin params: for buffer arguments the
+    // AIR location_index is the parameter's position, and the launch path binds buffers in order
+    // starting at 0, so a gap would misalign every later binding.
+    bool append_runtime_const_params() {
+        if (runtime_const_symbols_ == nullptr || runtime_const_symbols_->empty()) {
+            return true;
+        }
+        runtime_const_order_ = collect_runtime_const_references(entry_, *runtime_const_symbols_);
+        for (const std::string& symbol : runtime_const_order_) {
+            const bool device_space = runtime_const_symbols_->at(symbol).device_space;
+            ParamInfo p;
+            p.ptx_type = device_space ? ".global" : ".const";
+            p.llvm_type = device_space ? "i8 addrspace(1)*" : "i8 addrspace(2)*";
+            p.name = "__cumetal_const_" + sanitize_llvm_identifier(symbol, "sym");
+            p.raw_name = p.name;
+            params_->push_back(p);
+            arg_decls_->push_back(p.llvm_type + " %" + p.name);
+            runtime_const_arg_name_[symbol] = p.name;
+            runtime_const_arg_type_[symbol] = p.llvm_type;
+        }
+        return true;
+    }
+
     bool append_required_builtin_params() {
         bool needs_tid = false;
         bool needs_bid = false;
@@ -1624,6 +1765,18 @@ class GenericLlvmEmitter {
             os << "  " << ext << " = zext i32 %" << it->second << " to " << llvm_int_type(dst_bits) << "\n";
             return ext;
         }
+        if (token == "%activemask") {
+            declarations_.insert("declare i64 @air.simd_ballot.i64(i1)");
+            const std::string ballot64 = next_tmp("activemask64");
+            os << "  " << ballot64 << " = call i64 @air.simd_ballot.i64(i1 true)\n";
+            if (dst_bits == 64) {
+                return ballot64;
+            }
+            const std::string narrowed = next_tmp("activemask_narrow");
+            os << "  " << narrowed << " = trunc i64 " << ballot64 << " to "
+               << llvm_int_type(dst_bits) << "\n";
+            return narrowed;
+        }
         if (token == "%warpsize") {
             if (dst_bits <= 32) {
                 return std::string("32");
@@ -1711,6 +1864,12 @@ class GenericLlvmEmitter {
 
     std::optional<std::string> resolve_const_symbol_address(std::ostringstream& os,
                                                             const std::string& symbol) {
+        if (const auto rt = runtime_const_arg_name_.find(symbol); rt != runtime_const_arg_name_.end()) {
+            const std::string tmp = next_tmp("rtconst_p2i");
+            os << "  " << tmp << " = ptrtoint " << runtime_const_arg_type_.at(symbol) << " %" << rt->second
+               << " to i64\n";
+            return tmp;
+        }
         if (const_symbols_ == nullptr) {
             return std::nullopt;
         }
@@ -1740,7 +1899,10 @@ class GenericLlvmEmitter {
         return out;
     }
 
-    std::optional<std::string> get_param_slot(const std::string& name, int bits, bool create) {
+    // PTX reuses one `.param` name (param0, param1, ...) across every call site in a function, and
+    // different call sites give it different widths. One slot per name at a fixed 64 bits keeps
+    // lookup by name working while staying wide enough for all of them; each access converts.
+    std::optional<std::string> get_param_slot(const std::string& name, bool create) {
         auto it = call_param_slots_.find(name);
         if (it != call_param_slots_.end()) {
             return it->second;
@@ -1750,12 +1912,31 @@ class GenericLlvmEmitter {
         }
         const std::string slot = "%cm_callslot_" + sanitize_llvm_identifier(name, "slot") + "_" +
                                  std::to_string(slot_id_++);
-        entry_allocas_ << "  " << slot << " = alloca " << llvm_int_type(bits) << ", align " << std::max(1, bits / 8) << "\n";
-        entry_allocas_ << "  store " << llvm_int_type(bits) << " 0, " << llvm_int_type(bits) << "* " << slot
-                       << ", align " << std::max(1, bits / 8) << "\n";
+        entry_allocas_ << "  " << slot << " = alloca i64, align 8\n";
+        entry_allocas_ << "  store i64 0, i64* " << slot << ", align 8\n";
         call_param_slots_[name] = slot;
-        call_param_bits_[name] = bits;
         return slot;
+    }
+
+    void store_call_slot_bits(std::ostringstream& os, const std::string& slot,
+                              const std::string& value, int bits) {
+        std::string wide = value;
+        if (bits < 64) {
+            wide = next_tmp("callslot_zext");
+            os << "  " << wide << " = zext " << llvm_int_type(bits) << " " << value << " to i64\n";
+        }
+        os << "  store i64 " << wide << ", i64* " << slot << ", align 8\n";
+    }
+
+    std::string load_call_slot_bits(std::ostringstream& os, const std::string& slot, int bits) {
+        const std::string wide = next_tmp("callslot_ld");
+        os << "  " << wide << " = load i64, i64* " << slot << ", align 8\n";
+        if (bits >= 64) {
+            return wide;
+        }
+        const std::string narrow = next_tmp("callslot_trunc");
+        os << "  " << narrow << " = trunc i64 " << wide << " to " << llvm_int_type(bits) << "\n";
+        return narrow;
     }
 
     std::vector<std::string> parse_paren_tuple(std::string text) {
@@ -1769,14 +1950,11 @@ class GenericLlvmEmitter {
     std::optional<std::string> load_call_slot_value(std::ostringstream& os,
                                                     const std::string& name,
                                                     int bits) {
-        auto slot = get_param_slot(name, bits, false);
+        auto slot = get_param_slot(name, false);
         if (!slot) {
             return std::nullopt;
         }
-        const std::string ld = next_tmp("ldcall");
-        os << "  " << ld << " = load " << llvm_int_type(bits) << ", " << llvm_int_type(bits)
-           << "* " << *slot << ", align " << std::max(1, bits / 8) << "\n";
-        return ld;
+        return load_call_slot_bits(os, *slot, bits);
     }
 
     std::optional<std::string> emit_integer_from_any(std::ostringstream& os,
@@ -2885,31 +3063,27 @@ class GenericLlvmEmitter {
             }
 
             if (starts_with(instr.opcode, "st.param")) {
-                auto slot = get_param_slot(mem.base, ty.bits, true);
+                auto slot = get_param_slot(mem.base, true);
                 if (!slot) return fail(instr, "unable to allocate call param slot");
                 if (ty.kind == PtxTypeSpec::Kind::kFloat) {
                     auto fv = decode_float_operand(os, data_token, ty.bits);
                     if (!fv) return fail(instr, "st.param float source unsupported");
                     auto bitsv = encode_value_to_reg_bits(os, *fv, ty.bits);
                     if (!bitsv) return fail(instr, "st.param float encode failed");
-                    os << "  store " << llvm_int_type(ty.bits) << " " << *bitsv << ", "
-                       << llvm_int_type(ty.bits) << "* " << *slot << ", align " << std::max(1, ty.bits / 8) << "\n";
+                    store_call_slot_bits(os, *slot, *bitsv, ty.bits);
                     return true;
                 }
                 auto iv = emit_integer_from_any(os, data_token, ty.bits, ty.is_signed);
                 if (!iv) return fail(instr, "st.param int source unsupported");
-                os << "  store " << llvm_int_type(ty.bits) << " " << *iv << ", "
-                   << llvm_int_type(ty.bits) << "* " << *slot << ", align " << std::max(1, ty.bits / 8) << "\n";
+                store_call_slot_bits(os, *slot, *iv, ty.bits);
                 return true;
             }
 
             if (starts_with(instr.opcode, "ld.param")) {
                 if (!is_register_name(data_token)) return fail(instr, "ld.param dst must be register");
-                auto slot = get_param_slot(mem.base, ty.bits, false);
+                auto slot = get_param_slot(mem.base, false);
                 if (!slot) return fail(instr, "ld.param unknown param slot");
-                const std::string ld = next_tmp("ldcallp");
-                os << "  " << ld << " = load " << llvm_int_type(ty.bits) << ", " << llvm_int_type(ty.bits)
-                   << "* " << *slot << ", align " << std::max(1, ty.bits / 8) << "\n";
+                const std::string ld = load_call_slot_bits(os, *slot, ty.bits);
                 return emit_store_reg_bits(os,
                                            data_token,
                                            ensure_reg_slot(data_token).bits,
@@ -2950,7 +3124,6 @@ class GenericLlvmEmitter {
             base_i64 = *local;
         } else if (addr_space == 3) {
             // Named .shared/.extern .shared symbol (e.g. extern __shared__ float sdata[]).
-            // All shared symbols map to offset 0 within the threadgroup buffer.
             if (const auto tg = resolve_threadgroup_symbol_address(os, mem.base)) {
                 base_i64 = *tg;
             } else {
@@ -3060,10 +3233,9 @@ class GenericLlvmEmitter {
                             return false;
                         }
                     } else {
-                        auto slot = get_param_slot(d, bits, true);
+                        auto slot = get_param_slot(d, true);
                         if (!slot) return false;
-                        os << "  store " << llvm_int_type(bits) << " " << bits_value << ", "
-                           << llvm_int_type(bits) << "* " << *slot << ", align " << std::max(1, bits / 8) << "\n";
+                        store_call_slot_bits(os, *slot, bits_value, bits);
                     }
                 }
             }
@@ -3082,6 +3254,41 @@ class GenericLlvmEmitter {
             const std::string bits = next_tmp("callf2i");
             os << "  " << bits << " = bitcast float " << fval << " to i32\n";
             return store_ret_bits(bits, 32);
+        };
+
+        // libdevice's double-precision entry points. Metal has no FP64 unit and the emulated FP64
+        // here is a Dekker FP32 pair, so these evaluate at float precision: the low half of the
+        // argument is dropped and the result carries ~1e-7 relative error instead of ~1e-16.
+        auto load_call_slot_f64_as_f32 = [&](const std::string& arg_name) -> std::optional<std::string> {
+            auto bits = load_call_slot_value(os, arg_name, 64);
+            if (!bits) return std::nullopt;
+            if (fp64_mode_ == cumetal::ptx::Fp64Mode::kEmulate) {
+                const std::string hi_bits = next_tmp("calld_hi");
+                os << "  " << hi_bits << " = trunc i64 " << *bits << " to i32\n";
+                const std::string f = next_tmp("calldf");
+                os << "  " << f << " = bitcast i32 " << hi_bits << " to float\n";
+                return f;
+            }
+            const std::string d = next_tmp("calld");
+            os << "  " << d << " = bitcast i64 " << *bits << " to double\n";
+            const std::string f = next_tmp("calldf");
+            os << "  " << f << " = fptrunc double " << d << " to float\n";
+            return f;
+        };
+
+        auto store_ret_f64_from_f32 = [&](const std::string& fval) -> bool {
+            if (fp64_mode_ == cumetal::ptx::Fp64Mode::kEmulate) {
+                const std::string hi_bits = next_tmp("calldf2i");
+                os << "  " << hi_bits << " = bitcast float " << fval << " to i32\n";
+                const std::string packed = next_tmp("calld_pack");
+                os << "  " << packed << " = zext i32 " << hi_bits << " to i64\n";
+                return store_ret_bits(packed, 64);
+            }
+            const std::string d = next_tmp("calldext");
+            os << "  " << d << " = fpext float " << fval << " to double\n";
+            const std::string bits = next_tmp("calldf2i");
+            os << "  " << bits << " = bitcast double " << d << " to i64\n";
+            return store_ret_bits(bits, 64);
         };
 
         if (callee == "vprintf") {
@@ -3183,6 +3390,30 @@ class GenericLlvmEmitter {
             const std::string rbits = next_tmp("rsqrtf_i");
             os << "  " << rbits << " = bitcast float " << r << " to i32\n";
             return store_ret_bits(rbits, 32);
+        }
+
+        if (callee == "__nv_log1pf") {
+            if (arg_names.empty()) return fail(instr, "__nv_log1pf expects 1 arg");
+            auto value = load_call_slot_f32(arg_names[0]);
+            if (!value) return fail(instr, "__nv_log1pf arg missing");
+            const std::string biased = next_tmp("log1pf_add");
+            os << "  " << biased << " = fadd float 1.000000e+00, " << *value << "\n";
+            declarations_.insert("declare float @air.log.f32(float)");
+            const std::string out = next_tmp("log1pf");
+            os << "  " << out << " = call float @air.log.f32(float " << biased << ")\n";
+            return store_ret_f32(out);
+        }
+
+        if (callee == "__nv_float2int_rn") {
+            if (arg_names.empty()) return fail(instr, "__nv_float2int_rn expects 1 arg");
+            auto value = load_call_slot_f32(arg_names[0]);
+            if (!value) return fail(instr, "__nv_float2int_rn arg missing");
+            declarations_.insert("declare float @air.fast_rint.f32(float)");
+            const std::string rounded = next_tmp("f2i_rint");
+            os << "  " << rounded << " = call float @air.fast_rint.f32(float " << *value << ")\n";
+            const std::string out = next_tmp("f2i");
+            os << "  " << out << " = fptosi float " << rounded << " to i32\n";
+            return store_ret_bits(out, 32);
         }
 
         if (callee == "__nv_fabsf") {
@@ -3307,6 +3538,12 @@ class GenericLlvmEmitter {
         };
         static const FloatBuiltin kFloatBuiltins[] = {
             {"__nv_sqrtf", "air.fast_sqrt.f32", 1},
+            // The _rn suffix asks for IEEE round-to-nearest, which is Metal's precise:: family.
+            {"__nv_fsqrt_rn", "air.sqrt.f32", 1},
+            {"__nv_frsqrt_rn", "air.rsqrt.f32", 1},
+            {"__nv_fast_logf", "air.fast_log.f32", 1},
+            {"__nv_fast_sinf", "air.fast_sin.f32", 1},
+            {"__nv_fast_cosf", "air.fast_cos.f32", 1},
             {"__nv_expf", "air.fast_exp.f32", 1},
             {"__nv_fast_expf", "air.fast_exp.f32", 1},
             {"__nv_exp2f", "air.fast_exp2.f32", 1},
@@ -3361,6 +3598,74 @@ class GenericLlvmEmitter {
             }
             os << ")\n";
             return store_ret_f32(out);
+        }
+
+        // The double-precision spellings of the same functions, evaluated at float precision.
+        static const FloatBuiltin kDoubleBuiltins[] = {
+            {"__nv_sqrt", "air.sqrt.f32", 1},
+            {"__nv_rsqrt", "air.rsqrt.f32", 1},
+            {"__nv_exp", "air.fast_exp.f32", 1},
+            {"__nv_exp2", "air.fast_exp2.f32", 1},
+            {"__nv_log", "air.fast_log.f32", 1},
+            {"__nv_log2", "air.fast_log2.f32", 1},
+            {"__nv_log10", "air.fast_log10.f32", 1},
+            {"__nv_sin", "air.fast_sin.f32", 1},
+            {"__nv_cos", "air.fast_cos.f32", 1},
+            {"__nv_tan", "air.fast_tan.f32", 1},
+            {"__nv_asin", "air.fast_asin.f32", 1},
+            {"__nv_acos", "air.fast_acos.f32", 1},
+            {"__nv_atan", "air.fast_atan.f32", 1},
+            {"__nv_floor", "llvm.floor.f32", 1},
+            {"__nv_ceil", "llvm.ceil.f32", 1},
+            {"__nv_trunc", "llvm.trunc.f32", 1},
+            {"__nv_round", "llvm.round.f32", 1},
+            {"__nv_fabs", "llvm.fabs.f32", 1},
+            {"__nv_pow", "air.fast_pow.f32", 2},
+            {"__nv_atan2", "air.fast_atan2.f32", 2},
+            {"__nv_fmod", "air.fmod.f32", 2},
+            {"__nv_copysign", "llvm.copysign.f32", 2},
+            {"__nv_fma", "llvm.fma.f32", 3},
+        };
+        for (const FloatBuiltin& db : kDoubleBuiltins) {
+            if (callee != db.nv) continue;
+            if (static_cast<int>(arg_names.size()) < db.arity) {
+                return fail(instr, callee + " expects " + std::to_string(db.arity) + " arg(s)");
+            }
+            std::vector<std::string> values;
+            for (int i = 0; i < db.arity; ++i) {
+                auto v = load_call_slot_f64_as_f32(arg_names[static_cast<std::size_t>(i)]);
+                if (!v) return fail(instr, callee + " arg missing");
+                values.push_back(*v);
+            }
+            std::string decl = "declare float @" + std::string(db.sym) + "(float";
+            for (int i = 1; i < db.arity; ++i) decl += ", float";
+            decl += ")";
+            declarations_.insert(decl);
+            const std::string out = next_tmp("nvmathd");
+            os << "  " << out << " = call float @" << db.sym << "(";
+            for (int i = 0; i < db.arity; ++i) {
+                if (i != 0) os << ", ";
+                os << "float " << values[static_cast<std::size_t>(i)];
+            }
+            os << ")\n";
+            return store_ret_f64_from_f32(out);
+        }
+
+        if (callee == "__nv_hypot") {
+            if (arg_names.size() < 2) return fail(instr, "__nv_hypot expects 2 args");
+            auto x = load_call_slot_f64_as_f32(arg_names[0]);
+            auto y = load_call_slot_f64_as_f32(arg_names[1]);
+            if (!x || !y) return fail(instr, "__nv_hypot args missing");
+            declarations_.insert("declare float @air.fast_sqrt.f32(float)");
+            const std::string xx = next_tmp("hypotd_xx");
+            const std::string yy = next_tmp("hypotd_yy");
+            const std::string sum = next_tmp("hypotd_sum");
+            const std::string out = next_tmp("hypotd");
+            os << "  " << xx << " = fmul float " << *x << ", " << *x << "\n";
+            os << "  " << yy << " = fmul float " << *y << ", " << *y << "\n";
+            os << "  " << sum << " = fadd float " << xx << ", " << yy << "\n";
+            os << "  " << out << " = call float @air.fast_sqrt.f32(float " << sum << ")\n";
+            return store_ret_f64_from_f32(out);
         }
 
         // Functions with no direct Metal builtin, expressed exactly in terms of
@@ -4449,7 +4754,12 @@ class GenericLlvmEmitter {
         const std::string local = next_tmp("shfl_local");
         os << "  " << local << " = sub i32 " << lane << ", " << base << "\n";
 
-        std::string target;
+        // The AIR simd_shuffle_{down,up,xor} intrinsics take a *delta* (or xor mask), not an
+        // absolute lane index; only air.simd_shuffle takes an absolute lane. PTX's sub-warp
+        // `width` has no AIR equivalent, so the shuffle always runs across the full simdgroup
+        // and the `valid` predicate below restores CUDA's semantics of returning the lane's
+        // own value when the partner falls outside the width segment.
+        std::string shuffle_operand;
         std::string valid;
         if (instr.opcode.find(".down.") != std::string::npos) {
             const std::string t = next_tmp("shfl_t");
@@ -4458,25 +4768,21 @@ class GenericLlvmEmitter {
             os << "  " << limit << " = add i32 " << base << ", " << width << "\n";
             const std::string ok = next_tmp("shfl_ok");
             os << "  " << ok << " = icmp ult i32 " << t << ", " << limit << "\n";
-            target = t;
+            shuffle_operand = *sel;
             valid = ok;
             declarations_.insert("declare i32 @air.simd_shuffle_down.u.i32(i32, i16)");
         } else if (instr.opcode.find(".up.") != std::string::npos) {
-            const std::string t = next_tmp("shfl_t");
-            os << "  " << t << " = sub i32 " << lane << ", " << *sel << "\n";
             const std::string ok = next_tmp("shfl_ok");
             os << "  " << ok << " = icmp uge i32 " << local << ", " << *sel << "\n";
-            target = t;
+            shuffle_operand = *sel;
             valid = ok;
             declarations_.insert("declare i32 @air.simd_shuffle_up.u.i32(i32, i16)");
         } else if (instr.opcode.find(".bfly.") != std::string::npos) {
             const std::string tlocal = next_tmp("shfl_tlocal");
             os << "  " << tlocal << " = xor i32 " << local << ", " << *sel << "\n";
-            const std::string t = next_tmp("shfl_t");
-            os << "  " << t << " = add i32 " << base << ", " << tlocal << "\n";
             const std::string ok = next_tmp("shfl_ok");
             os << "  " << ok << " = icmp ult i32 " << tlocal << ", " << width << "\n";
-            target = t;
+            shuffle_operand = *sel;
             valid = ok;
             declarations_.insert("declare i32 @air.simd_shuffle_xor.u.i32(i32, i16)");
         } else {
@@ -4487,13 +4793,13 @@ class GenericLlvmEmitter {
             os << "  " << src_local << " = and i32 " << *sel << ", " << width_minus_1 << "\n";
             const std::string t = next_tmp("shfl_t");
             os << "  " << t << " = add i32 " << base << ", " << src_local << "\n";
-            target = t;
+            shuffle_operand = t;
             valid = "true";
             declarations_.insert("declare i32 @air.simd_shuffle.u.i32(i32, i16)");
         }
 
         const std::string target16 = next_tmp("shfl_t16");
-        os << "  " << target16 << " = trunc i32 " << target << " to i16\n";
+        os << "  " << target16 << " = trunc i32 " << shuffle_operand << " to i16\n";
         const std::string call = next_tmp("shfl_call");
         if (instr.opcode.find(".down.") != std::string::npos) {
             os << "  " << call << " = call i32 @air.simd_shuffle_down.u.i32(i32 " << *src
@@ -4756,6 +5062,7 @@ GenericLlvmBodyResult try_emit_generic_llvm_body(std::string_view ptx_source,
                                                  std::vector<ParamInfo>* params,
                                                  std::vector<std::string>* arg_decls,
                                                  const std::unordered_map<std::string, ConstSymbolInfo>* const_symbols,
+                                                 const std::unordered_map<std::string, RuntimeConstSymbolInfo>* runtime_const_symbols,
                                                  const std::unordered_map<std::string, SharedSymbolInfo>* shared_symbols,
                                                  cumetal::ptx::Fp64Mode fp64_mode = cumetal::ptx::Fp64Mode::kNative) {
     GenericLlvmBodyResult out;
@@ -4781,8 +5088,8 @@ GenericLlvmBodyResult try_emit_generic_llvm_body(std::string_view ptx_source,
     }
 
     const auto local_depots = parse_ptx_local_depots(ptx_source, entry_name);
-    GenericLlvmEmitter emitter(*entry, params, arg_decls, const_symbols, shared_symbols,
-                               &local_depots, fp64_mode);
+    GenericLlvmEmitter emitter(*entry, params, arg_decls, const_symbols, runtime_const_symbols,
+                               shared_symbols, &local_depots, fp64_mode);
     return emitter.run();
 }
 
@@ -4792,6 +5099,30 @@ GenericLlvmBodyResult try_emit_generic_llvm_body(std::string_view ptx_source,
 
 
 }  // namespace
+
+std::vector<std::string> runtime_const_symbols_for_entry(std::string_view ptx,
+                                                         std::string_view entry_name) {
+    auto runtime_consts = parse_ptx_runtime_const_arrays(ptx);
+    for (const ParsedConstB8Array& array : parse_ptx_const_b8_arrays(ptx)) {
+        runtime_consts.erase(array.symbol);
+    }
+    if (runtime_consts.empty()) {
+        return {};
+    }
+
+    ParseOptions parse_opts;
+    parse_opts.strict = false;
+    const auto parsed = parse_ptx(ptx, parse_opts);
+    if (!parsed.ok) {
+        return {};
+    }
+    for (const auto& entry : parsed.module.entries) {
+        if (entry.name == entry_name) {
+            return collect_runtime_const_references(entry, runtime_consts);
+        }
+    }
+    return {};
+}
 
 LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx, const LowerToLlvmOptions& options) {
     LowerToLlvmResult result;
@@ -4904,6 +5235,13 @@ LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx, const LowerToLlvmOp
         const_global_defs.push_back(def.str());
     }
 
+    std::unordered_map<std::string, RuntimeConstSymbolInfo> runtime_const_symbols =
+        parse_ptx_runtime_const_arrays(ptx);
+    for (const auto& [symbol, info] : const_symbols) {
+        (void)info;
+        runtime_const_symbols.erase(symbol);
+    }
+
     const auto shared_symbols = parse_ptx_shared_symbols(ptx, pipeline.entry_name);
 
     // Always attempt to lower the kernel's real body first. Nothing may pre-empt this on the
@@ -4919,6 +5257,7 @@ LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx, const LowerToLlvmOp
                                                   &generic_params,
                                                   &generic_arg_decls,
                                                   &const_symbols,
+                                                  &runtime_const_symbols,
                                                   &shared_symbols,
                                                   options.fp64_mode);
         if (generic_body.ok) {
