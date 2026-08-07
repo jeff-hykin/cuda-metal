@@ -43,7 +43,7 @@ run_pair() {
 
     "${SNIPPET}" --cpu "--${geometry}" --stacked --bodies 2 "--${mode}" --steps "${STEPS}" \
         --dump "${cpu_dump}" >"${cpu_log}" 2>&1
-    env \
+    /usr/bin/env \
         CUMETAL_USE_METAL_DEVICE_ADDRESSES=1 \
         CUMETAL_PHYSX_KERNEL_DIR="${KERNEL_DIR}" \
         CUMETAL_SYNC_EACH_LAUNCH=1 \

@@ -7,7 +7,8 @@ if [[ $# -ne 1 ]]; then
 fi
 
 REPORT_SCRIPT="$1"
-TEST_ROOT="$(mktemp -d -t cumetal-ci-report-test)"
+# BSD mktemp needs the trailing X's; GNU treats them as optional.
+TEST_ROOT="$(mktemp -d -t cumetal-ci-report-test.XXXXXX)"
 trap 'rm -rf "${TEST_ROOT}"' EXIT
 
 mkdir -p "${TEST_ROOT}/bin"

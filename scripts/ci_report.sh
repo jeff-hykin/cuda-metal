@@ -38,7 +38,8 @@ for argument in "$@"; do
     esac
 done
 
-LOG="$(mktemp -t cumetal-ctest)"
+# BSD mktemp needs the trailing X's; GNU treats them as optional.
+LOG="$(mktemp -t cumetal-ctest.XXXXXX)"
 trap 'rm -f "${LOG}"' EXIT
 
 ctest --test-dir "${BUILD_DIR}" --output-on-failure "${CTEST_ARGS[@]}" 2>&1 | tee "${LOG}"

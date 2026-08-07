@@ -14,14 +14,14 @@ mkdir -p "$HOME_DIR"
 
 cleanup() {
   if [[ -x "$PREFIX/uninstall.sh" ]]; then
-    env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
+    /usr/bin/env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
       bash "$PREFIX/uninstall.sh" "$PREFIX" >/dev/null
   fi
   rm -rf "$TMP_ROOT"
 }
 trap cleanup EXIT
 
-env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
+/usr/bin/env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
   bash "$INSTALL_SCRIPT" "$BUILD_DIR" "$PREFIX"
 
 if [[ -e "$HOME_DIR/.zshrc" ]]; then

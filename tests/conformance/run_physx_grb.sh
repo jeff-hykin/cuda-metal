@@ -35,7 +35,7 @@ mkdir -p "${RESULT_DIR}"
 
 "${SNIPPET}" --cpu --steps "${STEPS}" --dump "${CPU_DUMP}" >"${CPU_LOG}" 2>&1
 
-env \
+/usr/bin/env \
     CUMETAL_USE_METAL_DEVICE_ADDRESSES=1 \
     CUMETAL_PHYSX_KERNEL_DIR="${KERNEL_DIR}" \
     CUMETAL_SYNC_EACH_LAUNCH=1 \

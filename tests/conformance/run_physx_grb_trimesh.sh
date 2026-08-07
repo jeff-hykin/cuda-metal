@@ -59,7 +59,7 @@ if not rows or float(rows[0]["px"]) >= 0.0 or float(rows[-1]["px"]) <= 0.0:
     raise SystemExit("FAIL: triangle-mesh conformance trajectory does not cross the internal seam")
 PY
 
-env \
+/usr/bin/env \
     CUMETAL_USE_METAL_DEVICE_ADDRESSES=1 \
     CUMETAL_PHYSX_KERNEL_DIR="${KERNEL_DIR}" \
     CUMETAL_SYNC_EACH_LAUNCH=1 \
@@ -79,7 +79,7 @@ for mode in friction frictionless; do
         mode_dump="${FRICTION_OFF_DUMP}"
         mode_log="${FRICTION_OFF_LOG}"
     fi
-    env \
+    /usr/bin/env \
         CUMETAL_USE_METAL_DEVICE_ADDRESSES=1 \
         CUMETAL_PHYSX_KERNEL_DIR="${KERNEL_DIR}" \
         CUMETAL_SYNC_EACH_LAUNCH=1 \

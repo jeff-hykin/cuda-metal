@@ -111,7 +111,7 @@ run_cu_stage() {
   # Avoid empty-array expansion under `set -u` (macOS /bin/bash 3.2).
   set +e
   if [[ "$#" -gt 0 ]]; then
-    env "$@" "${CUMETALC}" "${src}" -o "${bin}" >"${logf}.compile" 2>&1
+    /usr/bin/env "$@" "${CUMETALC}" "${src}" -o "${bin}" >"${logf}.compile" 2>&1
   else
     "${CUMETALC}" "${src}" -o "${bin}" >"${logf}.compile" 2>&1
   fi
@@ -128,7 +128,7 @@ run_cu_stage() {
 
   set +e
   if [[ "$#" -gt 0 ]]; then
-    env "$@" "${bin}" >"${logf}.run" 2>&1
+    /usr/bin/env "$@" "${bin}" >"${logf}.run" 2>&1
   else
     "${bin}" >"${logf}.run" 2>&1
   fi

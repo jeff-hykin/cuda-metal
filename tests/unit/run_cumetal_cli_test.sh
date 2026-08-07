@@ -23,7 +23,7 @@ if [[ "$DOCTOR_OUTPUT" == *$'\033['* ]]; then
   exit 1
 fi
 
-COLOR_OUTPUT="$(env -u NO_COLOR CLICOLOR_FORCE=1 "$CUMETAL" doctor)"
+COLOR_OUTPUT="$(/usr/bin/env -u NO_COLOR CLICOLOR_FORCE=1 "$CUMETAL" doctor)"
 if [[ "$COLOR_OUTPUT" != *$'\033[32m[✓]'* ]]; then
   echo "FAIL: forced-color doctor output did not color its success markers" >&2
   exit 1

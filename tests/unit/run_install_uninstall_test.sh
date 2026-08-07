@@ -19,7 +19,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Default installation must not mutate shell startup files.
-env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
+/usr/bin/env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
   bash "$INSTALL_SCRIPT" "$BUILD_DIR" "$PREFIX"
 
 test -x "$PREFIX/bin/air_inspect"
@@ -38,7 +38,7 @@ test ! -e "$HOME_DIR/.zshrc"
 "$PREFIX/bin/cumetal" version | grep -q "^cumetal "
 "$PREFIX/bin/cumetal" run /usr/bin/true
 
-env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
+/usr/bin/env -u CUMETAL_SHELL_RC HOME="$HOME_DIR" SHELL=/bin/zsh \
   bash "$PREFIX/uninstall.sh" "$PREFIX"
 
 if [[ -e "$PREFIX/bin/air_inspect" || -e "$PREFIX/lib/libcumetal.dylib" ]]; then

@@ -55,7 +55,7 @@ KERNEL_DIR="${BUILD_DIR}/sdk_cumetal_gpu_source_bin/kernels"
 SNIPPET="${BUILD_DIR}/artifacts/bin/UNKNOWN/release/SnippetHelloGRB"
 RUN_LOG="${BUILD_DIR}/SnippetHelloGRB.cumetal.log"
 
-env \
+/usr/bin/env \
     CUMETAL_USE_METAL_DEVICE_ADDRESSES=1 \
     CUMETAL_PHYSX_KERNEL_DIR="${KERNEL_DIR}" \
     CUMETAL_SYNC_EACH_LAUNCH=1 \
