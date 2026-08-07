@@ -1687,6 +1687,35 @@ std::string emit_metal_source_generic(const std::string& entry_name,
         return (end > pct + 1) ? op.substr(pct, end - pct) : std::string{};
     };
 
+    // Byte displacement of a memory operand: "[%rd3]" → 0, "[%rd3+4]" → 4.
+    // Returns -1 for anything else (negative or non-decimal), which callers treat
+    // as unmodellable.
+    auto get_addr_disp = [](const std::string& op) -> int {
+        const std::size_t plus = op.find('+');
+        if (plus == std::string::npos) {
+            return 0;
+        }
+        int val = 0;
+        bool any_digit = false;
+        for (std::size_t i = plus + 1; i < op.size() && op[i] != ']'; ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(op[i]))) {
+                return -1;
+            }
+            val = val * 10 + (op[i] - '0');
+            any_digit = true;
+        }
+        return any_digit ? val : -1;
+    };
+
+    // Byte width of an element type name produced by param_etype below.
+    auto etype_bytes = [](const std::string& type) -> int {
+        if (type == "double" || type == "long" || type == "ulong") return 8;
+        if (type == "float" || type == "int" || type == "uint") return 4;
+        if (type == "short" || type == "ushort") return 2;
+        if (type == "char" || type == "uchar") return 1;
+        return 0;
+    };
+
     // Return a non-negative integer if the operand is a plain decimal immediate.
     auto get_imm = [](const std::string& op) -> int {
         if (op.empty() || op[0] == '%') {
@@ -1925,6 +1954,11 @@ std::string emit_metal_source_generic(const std::string& entry_name,
             if (mreg.empty()) {
                 return {};
             }
+            // The emitter can only express `param[gid]`, which has no room for a
+            // byte displacement into the element. Leave those to the generic path.
+            if (get_addr_disp(addr_op) != 0) {
+                return {};
+            }
             const RegInfo* info = addr_info(instr_index);
             if (info == nullptr ||
                 (info->kind != RegKind::DerivedPtr &&
@@ -2100,6 +2134,13 @@ std::string emit_metal_source_generic(const std::string& entry_name,
             etype = value_type->second;
         } else {
             etype = "float";
+        }
+        // `param[gid]` advances by one element per thread, so it only reproduces the
+        // PTX address when the stride the PTX scaled the thread id by is exactly the
+        // element width. A struct-of-larger-stride or a vector element type indexes a
+        // different address entirely; hand those to the generic path.
+        if (info->kind == RegKind::DerivedPtr && info->byte_per_elem != etype_bytes(etype)) {
+            return {};
         }
         if (!pname.empty()) {
             param_etype[pname] = etype;
@@ -2741,6 +2782,9 @@ std::string emit_metal_source_generic(const std::string& entry_name,
             const RegInfo* info = addr_info(instr_index);
             if (info == nullptr) return {};
             const bool is_derived = (info->kind == RegKind::DerivedPtr);
+            if (get_addr_disp(ops[1]) != 0 || (is_derived && info->byte_per_elem != 4)) {
+                return {};
+            }
             const std::string& pname = is_derived ? info->base_param
                                                    : info->param_name;
             const std::string atm = "atm_" + mvar(dest);
