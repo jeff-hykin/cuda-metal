@@ -648,6 +648,7 @@ install(FILES
     runtime/api/cuda_fp16.h
     runtime/api/cuda_runtime.h
     runtime/api/cuda_runtime_api.h
+    runtime/api/texture_types.h
     runtime/api/cufft.h
     runtime/api/curand.h
     runtime/api/cusparse.h

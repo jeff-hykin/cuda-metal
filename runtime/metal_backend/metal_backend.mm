@@ -88,9 +88,18 @@ std::size_t align_up(std::size_t value, std::size_t alignment) {
     return value + (alignment - remainder);
 }
 
+void residency_add(id<MTLAllocation> allocation);
+void residency_remove(id<MTLAllocation> allocation);
+
 class BufferImpl final : public Buffer {
 public:
-    explicit BufferImpl(id<MTLBuffer> buffer) : buffer_(buffer) {}
+    explicit BufferImpl(id<MTLBuffer> buffer) : buffer_(buffer) {
+        residency_add(buffer_);
+    }
+
+    ~BufferImpl() override {
+        residency_remove(buffer_);
+    }
 
     void* contents() const override {
         return [buffer_ contents];
@@ -333,6 +342,12 @@ struct BackendState {
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLSharedEvent> default_access_event = nil;
+    // A kernel can dereference any device address it was handed as data (texture handles,
+    // pointers inside by-value structs), so binding only the explicit arguments is not enough to
+    // keep the memory it reaches resident. Every allocation goes in here instead.
+    std::mutex residency_mutex;
+    id<MTLResidencySet> residency_set = nil;
+    bool residency_dirty = false;
     std::shared_ptr<StreamImpl> default_stream;
     std::unordered_map<std::string, id<MTLLibrary>> library_cache;
     std::unordered_map<std::string, std::string> library_lowering_source;
@@ -349,6 +364,36 @@ struct ResourceFenceReservation {
 
 BackendState& state();
 std::vector<std::shared_ptr<StreamImpl>> collect_live_streams_locked(BackendState& backend);
+
+void residency_add(id<MTLAllocation> allocation) {
+    BackendState& backend = state();
+    std::lock_guard<std::mutex> lock(backend.residency_mutex);
+    if (backend.residency_set == nil || allocation == nil) {
+        return;
+    }
+    [backend.residency_set addAllocation:allocation];
+    backend.residency_dirty = true;
+}
+
+void residency_remove(id<MTLAllocation> allocation) {
+    BackendState& backend = state();
+    std::lock_guard<std::mutex> lock(backend.residency_mutex);
+    if (backend.residency_set == nil || allocation == nil) {
+        return;
+    }
+    [backend.residency_set removeAllocation:allocation];
+    backend.residency_dirty = true;
+}
+
+void residency_commit() {
+    BackendState& backend = state();
+    std::lock_guard<std::mutex> lock(backend.residency_mutex);
+    if (backend.residency_set == nil || !backend.residency_dirty) {
+        return;
+    }
+    [backend.residency_set commit];
+    backend.residency_dirty = false;
+}
 
 std::vector<ResourceFenceReservation> encode_submission_waits(
     id<MTLCommandBuffer> command_buffer,
@@ -428,8 +473,10 @@ void encode_resource_signals(
 }
 
 BackendState& state() {
-    static BackendState kState;
-    return kState;
+    // Deliberately never destroyed: buffers can outlive static destruction, and their destructors
+    // take the residency lock, which would already be gone by then.
+    static BackendState* kState = new BackendState();
+    return *kState;
 }
 
 bool ensure_initialized(std::string* error_message) {
@@ -454,6 +501,20 @@ bool ensure_initialized(std::string* error_message) {
                 *error_message = "failed to create Metal command queue";
             }
             return false;
+        }
+        {
+            MTLResidencySetDescriptor* residency_desc = [[MTLResidencySetDescriptor alloc] init];
+            residency_desc.initialCapacity = 4096;
+            NSError* residency_error = nil;
+            backend.residency_set =
+                [backend.device newResidencySetWithDescriptor:residency_desc error:&residency_error];
+            if (backend.residency_set == nil) {
+                if (error_message != nullptr) {
+                    *error_message = "failed to create Metal residency set";
+                }
+                return false;
+            }
+            [backend.queue addResidencySet:backend.residency_set];
         }
         backend.default_access_event = [backend.device newSharedEvent];
         if (backend.default_access_event == nil) {
@@ -841,6 +902,7 @@ id<MTLBuffer> allocate_buffer_from_heap_locked(BackendState& backend,
     }
 
     backend.buffer_heaps.push_back(BackendState::HeapArena{.heap = heap, .size = arena_size});
+    residency_add(heap);
     id<MTLBuffer> buffer = [heap newBufferWithLength:size options:kBufferOptions];
     if (buffer == nil && error_message != nullptr) {
         *error_message = "newBufferWithLength from heap failed";
@@ -1048,6 +1110,9 @@ cudaError_t create_stream(std::shared_ptr<Stream>* out_stream,
             *error_message = "failed to create stream command queue";
         }
         return cudaErrorUnknown;
+    }
+    if (backend.residency_set != nil) {
+        [queue addResidencySet:backend.residency_set];
     }
     id<MTLSharedEvent> access_event = [backend.device newSharedEvent];
     if (access_event == nil) {
@@ -1936,6 +2001,7 @@ cudaError_t launch_kernel(const std::string& metallib_path,
         const auto fences =
             encode_submission_waits(command_buffer, stream_impl, std::move(fence_buffers));
 
+        residency_commit();
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
             if (error_message != nullptr) {
@@ -2190,6 +2256,7 @@ cudaError_t launch_kernel_timed(const std::string& metallib_path,
         const auto fences = encode_submission_waits(
             command_buffer, std::shared_ptr<StreamImpl>{}, std::move(fence_buffers));
 
+        residency_commit();
         id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
         if (encoder == nil) {
             if (error_message != nullptr) {

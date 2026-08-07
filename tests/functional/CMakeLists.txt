@@ -2879,6 +2879,16 @@ if(CUMETAL_ENABLE_CUDA_REGISTRATION)
     set_tests_properties(functional_cumetalc_link_executable PROPERTIES SKIP_RETURN_CODE 77)
 
     add_test(
+        NAME functional_texture_object
+        COMMAND bash
+                ${CMAKE_CURRENT_SOURCE_DIR}/run_texture_object.sh
+                $<TARGET_FILE:cumetalc>
+                ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/texture_object.cu
+                ${CMAKE_CURRENT_BINARY_DIR}/texture_object
+    )
+    set_tests_properties(functional_texture_object PROPERTIES SKIP_RETURN_CODE 77)
+
+    add_test(
         NAME functional_installed_cumetalc_link_executable
         COMMAND bash
                 ${CMAKE_CURRENT_SOURCE_DIR}/run_installed_cumetalc_link_executable.sh
