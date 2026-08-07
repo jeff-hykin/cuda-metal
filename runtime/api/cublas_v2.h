@@ -21,6 +21,7 @@ typedef enum cublasStatus_t {
     CUBLAS_STATUS_EXECUTION_FAILED = 13,
     CUBLAS_STATUS_INTERNAL_ERROR = 14,
     CUBLAS_STATUS_NOT_SUPPORTED = 15,
+    CUBLAS_STATUS_LICENSE_ERROR = 16,
 } cublasStatus_t;
 
 typedef enum cublasOperation_t {
@@ -29,10 +30,21 @@ typedef enum cublasOperation_t {
     CUBLAS_OP_C = 2,
 } cublasOperation_t;
 
+// cusolverDn.h declares these too; the guard lets both headers be included together, as they are in
+// the CUDA Toolkit where cusolverDn.h pulls them in from cublas_api.h.
+#ifndef CUMETAL_CUBLAS_MATRIX_MODES_DEFINED
+#define CUMETAL_CUBLAS_MATRIX_MODES_DEFINED
 typedef enum cublasFillMode_t {
     CUBLAS_FILL_MODE_LOWER = 0,
     CUBLAS_FILL_MODE_UPPER = 1,
+    CUBLAS_FILL_MODE_FULL = 2,
 } cublasFillMode_t;
+
+typedef enum cublasSideMode_t {
+    CUBLAS_SIDE_LEFT  = 0,
+    CUBLAS_SIDE_RIGHT = 1,
+} cublasSideMode_t;
+#endif
 
 typedef enum cublasMath_t {
     CUBLAS_DEFAULT_MATH = 0,
@@ -52,11 +64,6 @@ typedef enum cublasDiagType_t {
     CUBLAS_DIAG_NON_UNIT = 0,
     CUBLAS_DIAG_UNIT     = 1,
 } cublasDiagType_t;
-
-typedef enum cublasSideMode_t {
-    CUBLAS_SIDE_LEFT  = 0,
-    CUBLAS_SIDE_RIGHT = 1,
-} cublasSideMode_t;
 
 // cudaDataType_t — element types used by GemmEx and other extended APIs.
 typedef enum cudaDataType_t {

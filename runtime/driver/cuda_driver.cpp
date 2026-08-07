@@ -2417,11 +2417,10 @@ CUresult cuGraphInstantiate(CUgraphExec* phGraphExec, CUgraph hGraph,
         return CUDA_ERROR_INVALID_VALUE;
     }
     cudaGraphExec_t exec = nullptr;
-    cudaGraphNode_t errNode = nullptr;
-    cudaError_t err = cudaGraphInstantiate(
-        &exec, reinterpret_cast<cudaGraph_t>(hGraph), &errNode, logBuffer, bufferSize);
+    cudaError_t err = cudaGraphInstantiate(&exec, reinterpret_cast<cudaGraph_t>(hGraph), 0);
     *phGraphExec = reinterpret_cast<CUgraphExec>(exec);
-    if (phErrorNode) { *phErrorNode = reinterpret_cast<CUgraphNode>(errNode); }
+    if (phErrorNode) { *phErrorNode = nullptr; }
+    if (logBuffer && bufferSize > 0) { logBuffer[0] = '\0'; }
     return err == cudaSuccess ? CUDA_SUCCESS : CUDA_ERROR_INVALID_VALUE;
 }
 

@@ -31,7 +31,7 @@ static bool test_graph_instantiate_launch() {
     cudaGraphCreate(&graph, 0);
 
     cudaGraphExec_t exec = nullptr;
-    cudaError_t err = cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    cudaError_t err = cudaGraphInstantiate(&exec, graph, 0);
     if (err != cudaSuccess || exec == nullptr) {
         std::fprintf(stderr, "FAIL: cudaGraphInstantiate returned %d\n", err);
         return false;
@@ -161,7 +161,7 @@ static bool test_capture_memcpy_replay() {
 
     // Instantiate and launch
     cudaGraphExec_t exec = nullptr;
-    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphLaunch(exec, stream);
     cudaStreamSynchronize(stream);
 
@@ -205,7 +205,7 @@ static bool test_capture_memset_replay() {
     }
 
     cudaGraphExec_t exec = nullptr;
-    cudaGraphInstantiate(&exec, graph, nullptr, nullptr, 0);
+    cudaGraphInstantiate(&exec, graph, 0);
     cudaGraphLaunch(exec, stream);
     cudaStreamSynchronize(stream);
 

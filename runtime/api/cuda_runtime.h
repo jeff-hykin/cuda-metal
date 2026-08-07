@@ -9,7 +9,8 @@
 #define CUDARTAPI
 #endif
 
-#if defined(__clang__) && defined(__CUDA__)
+// Host translation units compare against these too (driver/runtime version checks are ordinary C++
+// code), so they must not sit inside the device-compilation branch below.
 #ifndef CUDA_VERSION
 #define CUDA_VERSION 12000
 #endif
@@ -17,6 +18,7 @@
 #define CUDART_VERSION CUDA_VERSION
 #endif
 
+#if defined(__clang__) && defined(__CUDA__)
 #ifndef __host__
 #define __host__ __attribute__((host))
 #endif
@@ -100,11 +102,13 @@ typedef enum cudaError {
     cudaErrorLaunchTimeout = 6,
     cudaErrorInvalidDevicePointer = 17,
     cudaErrorNotReady = 34,
+    cudaErrorInvalidDeviceFunction = 98,
     cudaErrorPeerAccessAlreadyEnabled = 50,
     cudaErrorPeerAccessNotEnabled = 51,
     cudaErrorDevicesUnavailable = 46,
     cudaErrorIllegalAddress = 700,
     cudaErrorNotSupported = 801,
+    cudaErrorGraphExecUpdateFailure = 910,
     cudaErrorUnknown = 999,
 } cudaError_t;
 
@@ -398,6 +402,24 @@ typedef enum cudaGraphNodeType {
     cudaGraphNodeTypeCount = 6,
 } cudaGraphNodeType;
 
+typedef enum cudaGraphExecUpdateResult {
+    cudaGraphExecUpdateSuccess = 0x0,
+    cudaGraphExecUpdateError = 0x1,
+    cudaGraphExecUpdateErrorTopologyChanged = 0x2,
+    cudaGraphExecUpdateErrorNodeTypeChanged = 0x3,
+    cudaGraphExecUpdateErrorFunctionChanged = 0x4,
+    cudaGraphExecUpdateErrorParametersChanged = 0x5,
+    cudaGraphExecUpdateErrorNotSupported = 0x6,
+    cudaGraphExecUpdateErrorUnsupportedFunctionChange = 0x7,
+    cudaGraphExecUpdateErrorAttributesChanged = 0x8,
+} cudaGraphExecUpdateResult;
+
+typedef struct cudaGraphExecUpdateResultInfo {
+    cudaGraphExecUpdateResult result;
+    cudaGraphNode_t errorNode;
+    cudaGraphNode_t errorFromNode;
+} cudaGraphExecUpdateResultInfo;
+
 enum {
     cudaDeviceScheduleAuto = 0x00,
     cudaDeviceScheduleSpin = 0x01,
@@ -664,9 +686,14 @@ cudaError_t cudaStreamEndCapture(cudaStream_t stream, cudaGraph_t* pGraph);
 cudaError_t cudaStreamIsCapturing(cudaStream_t stream, cudaStreamCaptureStatus* pCaptureStatus);
 cudaError_t cudaGraphCreate(cudaGraph_t* pGraph, unsigned int flags);
 cudaError_t cudaGraphDestroy(cudaGraph_t graph);
+// CUDA 12 signature. The CUDA 11 form that also took an error node and a log buffer is gone from
+// the Toolkit headers, and CUDART_VERSION here reports 12000.
 cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pGraphExec, cudaGraph_t graph,
-                                  cudaGraphNode_t* pErrorNode, char* pLogBuffer,
-                                  size_t bufferSize);
+                                  unsigned long long flags);
+cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pGraphExec, cudaGraph_t graph,
+                                           unsigned long long flags);
+cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
+                                 cudaGraphExecUpdateResultInfo* resultInfo);
 cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream);
 cudaError_t cudaGraphExecDestroy(cudaGraphExec_t graphExec);
 cudaError_t cudaGraphGetNodes(cudaGraph_t graph, cudaGraphNode_t* nodes, size_t* numNodes);
@@ -1001,6 +1028,33 @@ static __host__ __forceinline__ int max(int a, int b) {
 }
 
 static __host__ __forceinline__ int min(int a, int b) {
+    return a < b ? a : b;
+}
+
+// Same story as abs above: CUDA's math overlay overloads unqualified max/min for
+// floating-point operands, but clang's standalone overlay stops at the integer
+// forms, so `max(float, float)` silently truncates both arguments to int.
+static __device__ __host__ __forceinline__ float max(float a, float b) {
+    return a > b ? a : b;
+}
+
+static __device__ __host__ __forceinline__ float min(float a, float b) {
+    return a < b ? a : b;
+}
+
+static __device__ __host__ __forceinline__ double max(double a, double b) {
+    return a > b ? a : b;
+}
+
+static __device__ __host__ __forceinline__ double min(double a, double b) {
+    return a < b ? a : b;
+}
+
+static __device__ __host__ __forceinline__ unsigned int max(unsigned int a, unsigned int b) {
+    return a > b ? a : b;
+}
+
+static __device__ __host__ __forceinline__ unsigned int min(unsigned int a, unsigned int b) {
     return a < b ? a : b;
 }
 
@@ -1510,3 +1564,7 @@ static __device__ __forceinline__ int __dp4a(int a, int b, int c) {
 }
 
 #endif  // device code section
+
+// Outside the device-code branch: the samplers are templates, so they must not land inside the
+// extern "C" block above, and the record type is shared with the host side that fills it in.
+#include "texture_types.h"

@@ -12,6 +12,9 @@ extern "C" {
 typedef struct CUstream_st* cudaStream_t;
 typedef struct cusolverDnContext* cusolverDnHandle_t;
 
+// Shared with cublas_v2.h; whichever header is included first defines them.
+#ifndef CUMETAL_CUBLAS_MATRIX_MODES_DEFINED
+#define CUMETAL_CUBLAS_MATRIX_MODES_DEFINED
 typedef enum cublasFillMode_t {
     CUBLAS_FILL_MODE_LOWER = 0,
     CUBLAS_FILL_MODE_UPPER = 1,
@@ -22,6 +25,7 @@ typedef enum cublasSideMode_t {
     CUBLAS_SIDE_LEFT = 0,
     CUBLAS_SIDE_RIGHT = 1,
 } cublasSideMode_t;
+#endif
 
 // Handle management
 cusolverStatus_t cusolverDnCreate(cusolverDnHandle_t* handle);
