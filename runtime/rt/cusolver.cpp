@@ -15,6 +15,18 @@
 // On Apple Silicon UMA, device pointers are host-accessible, so LAPACK
 // operates directly on the caller's buffers with zero copy.
 
+extern "C" void* cumetalRuntimeGetHostPointer(const void* ptr, size_t count);
+
+namespace {
+// Everything below runs on the CPU through Accelerate. Device pointers are directly
+// host-addressable by default, but under CUMETAL_USE_METAL_DEVICE_ADDRESSES they are Metal GPU
+// addresses, so each one has to be mapped back before the CPU dereferences it.
+template <typename T>
+T* host_ptr(const T* ptr) {
+    return static_cast<T*>(cumetalRuntimeGetHostPointer(ptr, 0));
+}
+}  // namespace
+
 extern "C" {
 
 struct cusolverDnContext {
@@ -48,6 +60,14 @@ static void sync_stream(cusolverDnHandle_t handle) {
     if (handle && handle->stream) cudaStreamSynchronize(handle->stream);
 }
 
+// cuSOLVER reports numerical outcomes (a singular pivot, a leading minor that is not positive
+// definite) through devInfo while still returning CUSOLVER_STATUS_SUCCESS; only argument and
+// resource errors surface in the status. Callers that wrap every call in a throwing CHECK macro
+// depend on that split, so LAPACK's positive info must not become an error status here.
+static cusolverStatus_t lapack_info_to_status(__CLPK_integer info) {
+    return info < 0 ? CUSOLVER_STATUS_INVALID_VALUE : CUSOLVER_STATUS_SUCCESS;
+}
+
 // ── LU factorization ────────────────────────────────────────────────────────
 
 cusolverStatus_t cusolverDnSgetrf_bufferSize(cusolverDnHandle_t /*handle*/, int m, int n,
@@ -68,12 +88,13 @@ cusolverStatus_t cusolverDnSgetrf(cusolverDnHandle_t handle, int m, int n,
     sync_stream(handle);
     __CLPK_integer M = m, N = n, LDA = lda, info = 0;
     std::vector<__CLPK_integer> ipiv(static_cast<size_t>(std::min(m, n)));
-    sgetrf_(&M, &N, A, &LDA, ipiv.data(), &info);
+    sgetrf_(&M, &N, host_ptr(A), &LDA, ipiv.data(), &info);
     if (devIpiv) {
-        for (int i = 0; i < std::min(m, n); ++i) devIpiv[i] = static_cast<int>(ipiv[static_cast<size_t>(i)]);
+        int* host_ipiv = host_ptr(devIpiv);
+        for (int i = 0; i < std::min(m, n); ++i) host_ipiv[i] = static_cast<int>(ipiv[static_cast<size_t>(i)]);
     }
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDgetrf(cusolverDnHandle_t handle, int m, int n,
@@ -82,12 +103,13 @@ cusolverStatus_t cusolverDnDgetrf(cusolverDnHandle_t handle, int m, int n,
     sync_stream(handle);
     __CLPK_integer M = m, N = n, LDA = lda, info = 0;
     std::vector<__CLPK_integer> ipiv(static_cast<size_t>(std::min(m, n)));
-    dgetrf_(&M, &N, A, &LDA, ipiv.data(), &info);
+    dgetrf_(&M, &N, host_ptr(A), &LDA, ipiv.data(), &info);
     if (devIpiv) {
-        for (int i = 0; i < std::min(m, n); ++i) devIpiv[i] = static_cast<int>(ipiv[static_cast<size_t>(i)]);
+        int* host_ipiv = host_ptr(devIpiv);
+        for (int i = 0; i < std::min(m, n); ++i) host_ipiv[i] = static_cast<int>(ipiv[static_cast<size_t>(i)]);
     }
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 // ── LU solve ─────────────────────────────────────────────────────────────────
@@ -100,10 +122,11 @@ cusolverStatus_t cusolverDnSgetrs(cusolverDnHandle_t handle, int trans,
     char t = (trans == 0) ? 'N' : 'T';
     __CLPK_integer N = n, NRHS = nrhs, LDA = lda, LDB = ldb, info = 0;
     std::vector<__CLPK_integer> ipiv(static_cast<size_t>(n));
-    for (int i = 0; i < n; ++i) ipiv[static_cast<size_t>(i)] = devIpiv[i];
-    sgetrs_(&t, &N, &NRHS, const_cast<float*>(A), &LDA, ipiv.data(), B, &LDB, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    const int* host_ipiv = host_ptr(devIpiv);
+    for (int i = 0; i < n; ++i) ipiv[static_cast<size_t>(i)] = host_ipiv[i];
+    sgetrs_(&t, &N, &NRHS, host_ptr(A), &LDA, ipiv.data(), host_ptr(B), &LDB, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDgetrs(cusolverDnHandle_t handle, int trans,
@@ -114,10 +137,11 @@ cusolverStatus_t cusolverDnDgetrs(cusolverDnHandle_t handle, int trans,
     char t = (trans == 0) ? 'N' : 'T';
     __CLPK_integer N = n, NRHS = nrhs, LDA = lda, LDB = ldb, info = 0;
     std::vector<__CLPK_integer> ipiv(static_cast<size_t>(n));
-    for (int i = 0; i < n; ++i) ipiv[static_cast<size_t>(i)] = devIpiv[i];
-    dgetrs_(&t, &N, &NRHS, const_cast<double*>(A), &LDA, ipiv.data(), B, &LDB, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    const int* host_ipiv = host_ptr(devIpiv);
+    for (int i = 0; i < n; ++i) ipiv[static_cast<size_t>(i)] = host_ipiv[i];
+    dgetrs_(&t, &N, &NRHS, host_ptr(A), &LDA, ipiv.data(), host_ptr(B), &LDB, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 // ── QR factorization ────────────────────────────────────────────────────────
@@ -139,9 +163,9 @@ cusolverStatus_t cusolverDnSgeqrf(cusolverDnHandle_t handle, int m, int n,
                                    float* Workspace, int Lwork, int* devInfo) {
     sync_stream(handle);
     __CLPK_integer M = m, N = n, LDA = lda, LW = Lwork, info = 0;
-    sgeqrf_(&M, &N, A, &LDA, TAU, Workspace, &LW, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    sgeqrf_(&M, &N, host_ptr(A), &LDA, host_ptr(TAU), host_ptr(Workspace), &LW, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDgeqrf(cusolverDnHandle_t handle, int m, int n,
@@ -149,9 +173,9 @@ cusolverStatus_t cusolverDnDgeqrf(cusolverDnHandle_t handle, int m, int n,
                                    double* Workspace, int Lwork, int* devInfo) {
     sync_stream(handle);
     __CLPK_integer M = m, N = n, LDA = lda, LW = Lwork, info = 0;
-    dgeqrf_(&M, &N, A, &LDA, TAU, Workspace, &LW, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    dgeqrf_(&M, &N, host_ptr(A), &LDA, host_ptr(TAU), host_ptr(Workspace), &LW, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 // ── Cholesky factorization ──────────────────────────────────────────────────
@@ -176,9 +200,9 @@ cusolverStatus_t cusolverDnSpotrf(cusolverDnHandle_t handle, cublasFillMode_t up
     sync_stream(handle);
     char ul = (uplo == CUBLAS_FILL_MODE_UPPER) ? 'U' : 'L';
     __CLPK_integer N = n, LDA = lda, info = 0;
-    spotrf_(&ul, &N, A, &LDA, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    spotrf_(&ul, &N, host_ptr(A), &LDA, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDpotrf(cusolverDnHandle_t handle, cublasFillMode_t uplo,
@@ -187,9 +211,9 @@ cusolverStatus_t cusolverDnDpotrf(cusolverDnHandle_t handle, cublasFillMode_t up
     sync_stream(handle);
     char ul = (uplo == CUBLAS_FILL_MODE_UPPER) ? 'U' : 'L';
     __CLPK_integer N = n, LDA = lda, info = 0;
-    dpotrf_(&ul, &N, A, &LDA, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    dpotrf_(&ul, &N, host_ptr(A), &LDA, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 // ── Cholesky solve ──────────────────────────────────────────────────────────
@@ -200,9 +224,9 @@ cusolverStatus_t cusolverDnSpotrs(cusolverDnHandle_t handle, cublasFillMode_t up
     sync_stream(handle);
     char ul = (uplo == CUBLAS_FILL_MODE_UPPER) ? 'U' : 'L';
     __CLPK_integer N = n, NRHS = nrhs, LDA = lda, LDB = ldb, info = 0;
-    spotrs_(&ul, &N, &NRHS, const_cast<float*>(A), &LDA, B, &LDB, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    spotrs_(&ul, &N, &NRHS, host_ptr(A), &LDA, host_ptr(B), &LDB, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDpotrs(cusolverDnHandle_t handle, cublasFillMode_t uplo,
@@ -211,9 +235,9 @@ cusolverStatus_t cusolverDnDpotrs(cusolverDnHandle_t handle, cublasFillMode_t up
     sync_stream(handle);
     char ul = (uplo == CUBLAS_FILL_MODE_UPPER) ? 'U' : 'L';
     __CLPK_integer N = n, NRHS = nrhs, LDA = lda, LDB = ldb, info = 0;
-    dpotrs_(&ul, &N, &NRHS, const_cast<double*>(A), &LDA, B, &LDB, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    dpotrs_(&ul, &N, &NRHS, host_ptr(A), &LDA, host_ptr(B), &LDB, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 // ── Eigenvalue decomposition (syevd) ────────────────────────────────────────
@@ -247,9 +271,9 @@ cusolverStatus_t cusolverDnSsyevd(cusolverDnHandle_t handle, cusolverEigMode_t j
     // LAPACK's ssyevd also needs integer workspace
     __CLPK_integer liwork = std::max(__CLPK_integer(1), 3 + 5 * N);
     std::vector<__CLPK_integer> iwork(static_cast<size_t>(liwork));
-    ssyevd_(&job, &ul, &N, A, &LDA, W, work, &LW, iwork.data(), &liwork, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    ssyevd_(&job, &ul, &N, host_ptr(A), &LDA, host_ptr(W), host_ptr(work), &LW, iwork.data(), &liwork, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDsyevd(cusolverDnHandle_t handle, cusolverEigMode_t jobz,
@@ -261,9 +285,9 @@ cusolverStatus_t cusolverDnDsyevd(cusolverDnHandle_t handle, cusolverEigMode_t j
     __CLPK_integer N = n, LDA = lda, LW = lwork, info = 0;
     __CLPK_integer liwork = std::max(__CLPK_integer(1), 3 + 5 * N);
     std::vector<__CLPK_integer> iwork(static_cast<size_t>(liwork));
-    dsyevd_(&job, &ul, &N, A, &LDA, W, work, &LW, iwork.data(), &liwork, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    dsyevd_(&job, &ul, &N, host_ptr(A), &LDA, host_ptr(W), host_ptr(work), &LW, iwork.data(), &liwork, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 // ── SVD ─────────────────────────────────────────────────────────────────────
@@ -288,9 +312,10 @@ cusolverStatus_t cusolverDnSgesvd(cusolverDnHandle_t handle, signed char jobu,
     char ju = static_cast<char>(jobu);
     char jvt = static_cast<char>(jobvt);
     __CLPK_integer M = m, N = n, LDA = lda, LDU = ldu, LDVT = ldvt, LW = lwork, info = 0;
-    sgesvd_(&ju, &jvt, &M, &N, A, &LDA, S, U, &LDU, VT, &LDVT, work, &LW, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    sgesvd_(&ju, &jvt, &M, &N, host_ptr(A), &LDA, host_ptr(S), host_ptr(U), &LDU, host_ptr(VT),
+            &LDVT, host_ptr(work), &LW, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 cusolverStatus_t cusolverDnDgesvd(cusolverDnHandle_t handle, signed char jobu,
@@ -301,9 +326,10 @@ cusolverStatus_t cusolverDnDgesvd(cusolverDnHandle_t handle, signed char jobu,
     char ju = static_cast<char>(jobu);
     char jvt = static_cast<char>(jobvt);
     __CLPK_integer M = m, N = n, LDA = lda, LDU = ldu, LDVT = ldvt, LW = lwork, info = 0;
-    dgesvd_(&ju, &jvt, &M, &N, A, &LDA, S, U, &LDU, VT, &LDVT, work, &LW, &info);
-    if (devInfo) *devInfo = static_cast<int>(info);
-    return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
+    dgesvd_(&ju, &jvt, &M, &N, host_ptr(A), &LDA, host_ptr(S), host_ptr(U), &LDU, host_ptr(VT),
+            &LDVT, host_ptr(work), &LW, &info);
+    if (devInfo) *host_ptr(devInfo) = static_cast<int>(info);
+    return lapack_info_to_status(info);
 }
 
 } // extern "C" — temporarily close for C++ templates
@@ -362,8 +388,9 @@ cusolverStatus_t cusolverSpScsrlsvchol(cusolverSpHandle_t handle,
     const int base = descrA ? static_cast<int>(cusparseGetMatIndexBase(descrA)) : 0;
 
     std::vector<float> A(m * m);
-    csr_to_dense_sp(m, csrVal, csrRowPtr, csrColInd, base, A.data());
-    std::memcpy(x, b, m * sizeof(float));
+    csr_to_dense_sp(m, host_ptr(csrVal), host_ptr(csrRowPtr), host_ptr(csrColInd), base, A.data());
+    float* host_x = host_ptr(x);
+    std::memcpy(host_x, host_ptr(b), m * sizeof(float));
 
     char uplo = 'L';
     __CLPK_integer N = m, nrhs = 1, lda = m, ldb = m, info = 0;
@@ -372,7 +399,7 @@ cusolverStatus_t cusolverSpScsrlsvchol(cusolverSpHandle_t handle,
         if (singularity) *singularity = static_cast<int>(info - 1);
         return CUSOLVER_STATUS_INTERNAL_ERROR;
     }
-    spotrs_(&uplo, &N, &nrhs, A.data(), &lda, x, &ldb, &info);
+    spotrs_(&uplo, &N, &nrhs, A.data(), &lda, host_x, &ldb, &info);
     if (singularity) *singularity = -1; // no singularity
     return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
 }
@@ -390,8 +417,9 @@ cusolverStatus_t cusolverSpDcsrlsvchol(cusolverSpHandle_t handle,
     const int base = descrA ? static_cast<int>(cusparseGetMatIndexBase(descrA)) : 0;
 
     std::vector<double> A(m * m);
-    csr_to_dense_sp(m, csrVal, csrRowPtr, csrColInd, base, A.data());
-    std::memcpy(x, b, m * sizeof(double));
+    csr_to_dense_sp(m, host_ptr(csrVal), host_ptr(csrRowPtr), host_ptr(csrColInd), base, A.data());
+    double* host_x = host_ptr(x);
+    std::memcpy(host_x, host_ptr(b), m * sizeof(double));
 
     char uplo = 'L';
     __CLPK_integer N = m, nrhs = 1, lda = m, ldb = m, info = 0;
@@ -400,7 +428,7 @@ cusolverStatus_t cusolverSpDcsrlsvchol(cusolverSpHandle_t handle,
         if (singularity) *singularity = static_cast<int>(info - 1);
         return CUSOLVER_STATUS_INTERNAL_ERROR;
     }
-    dpotrs_(&uplo, &N, &nrhs, A.data(), &lda, x, &ldb, &info);
+    dpotrs_(&uplo, &N, &nrhs, A.data(), &lda, host_x, &ldb, &info);
     if (singularity) *singularity = -1;
     return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
 }
@@ -419,16 +447,17 @@ cusolverStatus_t cusolverSpScsrlsvqr(cusolverSpHandle_t handle,
     const int base = descrA ? static_cast<int>(cusparseGetMatIndexBase(descrA)) : 0;
 
     std::vector<float> A(m * m);
-    csr_to_dense_sp(m, csrVal, csrRowPtr, csrColInd, base, A.data());
-    std::memcpy(x, b, m * sizeof(float));
+    csr_to_dense_sp(m, host_ptr(csrVal), host_ptr(csrRowPtr), host_ptr(csrColInd), base, A.data());
+    float* host_x = host_ptr(x);
+    std::memcpy(host_x, host_ptr(b), m * sizeof(float));
 
     char trans = 'N';
     __CLPK_integer M = m, N = m, nrhs = 1, lda = m, ldb = m, lwork = -1, info = 0;
     float work_query = 0;
-    sgels_(&trans, &M, &N, &nrhs, A.data(), &lda, x, &ldb, &work_query, &lwork, &info);
+    sgels_(&trans, &M, &N, &nrhs, A.data(), &lda, host_x, &ldb, &work_query, &lwork, &info);
     lwork = static_cast<__CLPK_integer>(work_query);
     std::vector<float> work(lwork);
-    sgels_(&trans, &M, &N, &nrhs, A.data(), &lda, x, &ldb, work.data(), &lwork, &info);
+    sgels_(&trans, &M, &N, &nrhs, A.data(), &lda, host_x, &ldb, work.data(), &lwork, &info);
     if (singularity) *singularity = (info != 0) ? static_cast<int>(info - 1) : -1;
     return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
 }
@@ -446,16 +475,17 @@ cusolverStatus_t cusolverSpDcsrlsvqr(cusolverSpHandle_t handle,
     const int base = descrA ? static_cast<int>(cusparseGetMatIndexBase(descrA)) : 0;
 
     std::vector<double> A(m * m);
-    csr_to_dense_sp(m, csrVal, csrRowPtr, csrColInd, base, A.data());
-    std::memcpy(x, b, m * sizeof(double));
+    csr_to_dense_sp(m, host_ptr(csrVal), host_ptr(csrRowPtr), host_ptr(csrColInd), base, A.data());
+    double* host_x = host_ptr(x);
+    std::memcpy(host_x, host_ptr(b), m * sizeof(double));
 
     char trans = 'N';
     __CLPK_integer M = m, N = m, nrhs = 1, lda = m, ldb = m, lwork = -1, info = 0;
     double work_query = 0;
-    dgels_(&trans, &M, &N, &nrhs, A.data(), &lda, x, &ldb, &work_query, &lwork, &info);
+    dgels_(&trans, &M, &N, &nrhs, A.data(), &lda, host_x, &ldb, &work_query, &lwork, &info);
     lwork = static_cast<__CLPK_integer>(work_query);
     std::vector<double> work(lwork);
-    dgels_(&trans, &M, &N, &nrhs, A.data(), &lda, x, &ldb, work.data(), &lwork, &info);
+    dgels_(&trans, &M, &N, &nrhs, A.data(), &lda, host_x, &ldb, work.data(), &lwork, &info);
     if (singularity) *singularity = (info != 0) ? static_cast<int>(info - 1) : -1;
     return info == 0 ? CUSOLVER_STATUS_SUCCESS : CUSOLVER_STATUS_INTERNAL_ERROR;
 }

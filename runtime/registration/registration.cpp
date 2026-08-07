@@ -6,6 +6,7 @@
 #include "cumetal/ptx/lower_to_metal.h"
 #include "cumetal/ptx/lower_to_llvm.h"
 #include "cumetal/ptx/parser.h"
+#include "metal_backend.h"
 #include "fatbin_elf.h"
 #include "metal_math_mode.h"
 
@@ -297,6 +298,7 @@ struct RegistrationRecord {
     std::vector<cumetalKernelArgInfo_t> arg_info;
     bool arg_info_resolved = false;
     std::vector<std::string> printf_formats;
+    std::vector<std::string> const_symbol_buffers;
     std::size_t static_shared_bytes = 0;
 };
 
@@ -304,6 +306,8 @@ struct RegistrationSymbolRecord {
     void* module_handle = nullptr;
     const void* device_address = nullptr;
     std::size_t size = 0;
+    std::string device_name;
+    std::shared_ptr<cumetal::metal_backend::Buffer> storage;
 };
 
 struct RegistrationState {
@@ -311,6 +315,8 @@ struct RegistrationState {
     std::unordered_map<void*, std::unique_ptr<RegistrationModule>> modules;
     std::unordered_map<const void*, RegistrationRecord> kernels;
     std::unordered_map<const void*, RegistrationSymbolRecord> symbols;
+    std::unordered_map<std::string, std::shared_ptr<cumetal::metal_backend::Buffer>>
+        symbol_storage_by_name;
 };
 
 RegistrationState& state() {
@@ -1241,6 +1247,10 @@ bool lookup_registered_kernel(const void* host_function, RegisteredKernel* out) 
                 (void)find_arg_info_for_ptx_entry(*module.ptx_source,
                                                   found->second.kernel_name,
                                                   &found->second.arg_info);
+                // Derived from the PTX rather than from the lowering result so it is available
+                // even when a cached metallib makes lowering unnecessary.
+                found->second.const_symbol_buffers = cumetal::ptx::runtime_const_symbols_for_entry(
+                    *module.ptx_source, found->second.kernel_name);
             }
             found->second.arg_info_resolved = true;
         }
@@ -1280,6 +1290,7 @@ bool lookup_registered_kernel(const void* host_function, RegisteredKernel* out) 
     out->arg_info = record.arg_info;
     out->printf_formats = record.printf_formats;
     out->static_shared_bytes = record.static_shared_bytes;
+    out->const_symbol_buffers = record.const_symbol_buffers;
     return true;
 }
 
@@ -1301,6 +1312,22 @@ bool lookup_registered_symbol(const void* host_symbol,
     if (out_size != nullptr) {
         *out_size = found->second.size;
     }
+    return true;
+}
+
+bool lookup_symbol_storage(const std::string& device_name,
+                           std::shared_ptr<cumetal::metal_backend::Buffer>* out) {
+    if (device_name.empty() || out == nullptr) {
+        return false;
+    }
+
+    RegistrationState& s = state();
+    std::lock_guard<std::mutex> lock(s.mutex);
+    const auto found = s.symbol_storage_by_name.find(device_name);
+    if (found == s.symbol_storage_by_name.end() || found->second == nullptr) {
+        return false;
+    }
+    *out = found->second;
     return true;
 }
 
@@ -1478,10 +1505,6 @@ void __cudaRegisterVar(void** fat_cubin_handle,
                        std::size_t size,
                        int constant,
                        int global) {
-    (void)fat_cubin_handle;
-    (void)host_var;
-    (void)device_address;
-    (void)device_name;
     (void)ext;
     (void)constant;
     (void)global;
@@ -1490,20 +1513,53 @@ void __cudaRegisterVar(void** fat_cubin_handle,
         return;
     }
 
-    const void* mapped = device_address == nullptr ? static_cast<const void*>(host_var)
-                                                   : static_cast<const void*>(device_address);
+    // clang's CUDA codegen passes the mangled device *name* for both `device_address` and
+    // `device_name` (the real CUDA runtime ignores the former and resolves the symbol by name).
+    // Treating that as an address would point the symbol at a read-only __TEXT string, so storage
+    // is allocated here instead and the name is kept for binding the kernel argument. A caller
+    // that supplies a distinct, real address keeps that address as the symbol's storage.
+    const bool device_address_is_name =
+        device_address != nullptr && device_name != nullptr &&
+        (device_address == device_name || std::strcmp(device_address, device_name) == 0);
+    const bool use_caller_address = device_address != nullptr && !device_address_is_name;
+
     void* handle = fat_cubin_handle == nullptr ? nullptr : reinterpret_cast<void*>(fat_cubin_handle);
 
-    REG_DEBUG("__cudaRegisterVar: name='%s' host_var=%p mapped=%p size=%zu",
+    std::shared_ptr<cumetal::metal_backend::Buffer> storage;
+    if (size > 0 && !use_caller_address) {
+        std::string alloc_error;
+        const cudaError_t alloc_status =
+            cumetal::metal_backend::allocate_buffer(size, &storage, &alloc_error);
+        if (alloc_status != cudaSuccess) {
+            REG_DEBUG("__cudaRegisterVar: failed to allocate %zu bytes for '%s': %s", size,
+                      device_name != nullptr ? device_name : "(null)", alloc_error.c_str());
+            return;
+        }
+        std::memset(storage->contents(), 0, size);
+    }
+
+    const void* mapped = static_cast<const void*>(host_var);
+    if (storage != nullptr) {
+        mapped = static_cast<const void*>(storage->contents());
+    } else if (use_caller_address) {
+        mapped = static_cast<const void*>(device_address);
+    }
+
+    REG_DEBUG("__cudaRegisterVar: name='%s' host_var=%p storage=%p size=%zu",
               device_name != nullptr ? device_name : "(null)", static_cast<void*>(host_var),
               mapped, size);
 
     cumetal::registration::RegistrationState& s = cumetal::registration::state();
     std::lock_guard<std::mutex> lock(s.mutex);
+    if (storage != nullptr && device_name != nullptr && device_name[0] != '\0') {
+        s.symbol_storage_by_name[device_name] = storage;
+    }
     s.symbols[host_var] = cumetal::registration::RegistrationSymbolRecord{
         .module_handle = handle,
         .device_address = mapped,
         .size = size,
+        .device_name = device_name != nullptr ? std::string(device_name) : std::string(),
+        .storage = std::move(storage),
     };
 }
 

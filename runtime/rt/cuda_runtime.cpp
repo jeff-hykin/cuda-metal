@@ -125,8 +125,10 @@ struct cudaGraphNode_st {
     const void* func = nullptr;
     dim3 grid_dim{};
     dim3 block_dim{};
-    void** kernel_args = nullptr;
-    int num_args = 0;
+    // Argument values, copied by value when the node is recorded. cudaLaunchKernel receives a
+    // void** that points at temporaries in the host stub's stack frame, so those bytes are gone
+    // long before the graph replays; holding the caller's pointers would replay garbage.
+    std::vector<std::vector<std::uint8_t>> arg_values;
     size_t shared_mem = 0;
 
     // Memcpy node data
@@ -757,6 +759,16 @@ cudaError_t synchronize_stream_for_host_op(cudaStream_t stream,
     return cudaSuccess;
 }
 
+// CUDA's async copies are only truly asynchronous when the host side is page-locked. With
+// pageable host memory the driver stages the transfer, which makes the call host-synchronous:
+// a host->device copy returns once the source has been captured, and a device->host copy
+// returns once the destination has been filled. Callers rely on that — freeing a stack or
+// heap source immediately after the call is legal CUDA — so a deferred read of the caller's
+// buffer would be a use-after-free.
+bool is_pageable_host_pointer(const void* ptr) {
+    return ptr != nullptr && !is_device_pointer(ptr);
+}
+
 cudaError_t enqueue_stream_host_op(cudaStream_t stream, std::function<void()> operation) {
     std::shared_ptr<cumetal::metal_backend::Stream> backend_stream;
     const cudaError_t resolve_status =
@@ -767,6 +779,42 @@ cudaError_t enqueue_stream_host_op(cudaStream_t stream, std::function<void()> op
     std::string error;
     return cumetal::metal_backend::enqueue_host_function(
         backend_stream, std::move(operation), &error);
+}
+
+// Enqueues a (possibly pitched) copy of `rows` x `row_bytes` with the pageable staging
+// semantics described above `is_pageable_host_pointer`.
+cudaError_t enqueue_staged_copy(cudaStream_t stream,
+                                unsigned char* host_dst, std::size_t dst_pitch,
+                                const unsigned char* host_src, std::size_t src_pitch,
+                                std::size_t row_bytes, std::size_t rows,
+                                bool src_is_pageable, bool dst_is_pageable) {
+    auto copy_rows = [host_dst, dst_pitch, row_bytes, rows](const unsigned char* from,
+                                                            std::size_t from_pitch) {
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::memcpy(host_dst + row * dst_pitch, from + row * from_pitch, row_bytes);
+        }
+    };
+
+    // A pageable source may be freed the moment the call returns, so snapshot it now and let
+    // the stream write from the snapshot.
+    if (src_is_pageable) {
+        auto staging = std::make_shared<std::vector<unsigned char>>(row_bytes * rows);
+        for (std::size_t row = 0; row < rows; ++row) {
+            std::memcpy(staging->data() + row * row_bytes, host_src + row * src_pitch, row_bytes);
+        }
+        return enqueue_stream_host_op(stream, [copy_rows, staging, row_bytes]() {
+            copy_rows(staging->data(), row_bytes);
+        });
+    }
+
+    const cudaError_t status = enqueue_stream_host_op(
+        stream, [copy_rows, host_src, src_pitch]() { copy_rows(host_src, src_pitch); });
+    if (status != cudaSuccess) {
+        return status;
+    }
+    // Only a device -> pageable host transfer is host-blocking; the caller is entitled to read
+    // the destination as soon as the call returns.
+    return dst_is_pageable ? cudaStreamSynchronize(stream) : cudaSuccess;
 }
 
 cudaError_t update_event_completion(cudaEvent_t event, bool wait_for_completion) {
@@ -2427,11 +2475,13 @@ cudaError_t cudaMemcpyAsync(void* dst,
     if ((host_dst == nullptr || host_src == nullptr) && count > 0) {
         return fail(cudaErrorInvalidValue);
     }
-    const cudaError_t enqueue_status = enqueue_stream_host_op(
-        stream, [host_dst, host_src, count]() {
-            if (count > 0) std::memcpy(host_dst, host_src, count);
-        });
-    if (enqueue_status != cudaSuccess) return fail(enqueue_status);
+    if (count > 0) {
+        const cudaError_t enqueue_status =
+            enqueue_staged_copy(stream, static_cast<unsigned char*>(host_dst), count,
+                                static_cast<const unsigned char*>(host_src), count, count, 1,
+                                is_pageable_host_pointer(src), is_pageable_host_pointer(dst));
+        if (enqueue_status != cudaSuccess) return fail(enqueue_status);
+    }
 
     if (trace_enabled()) {
         char buf[128];
@@ -2705,10 +2755,12 @@ cudaError_t cudaMemcpy2DAsync(void* dst, size_t dpitch,
         src, height == 0 ? 0 : (height - 1) * spitch + width));
     if ((d == nullptr || s == nullptr) && width > 0 && height > 0)
         return fail(cudaErrorInvalidValue);
-    return fail(enqueue_stream_host_op(stream, [=]() {
-        for (size_t row = 0; row < height; ++row)
-            if (width > 0) std::memcpy(d + row * dpitch, s + row * spitch, width);
-    }));
+    if (width == 0 || height == 0) {
+        return fail(cudaSuccess);
+    }
+    return fail(enqueue_staged_copy(stream, d, dpitch, s, spitch, width, height,
+                                    is_pageable_host_pointer(src),
+                                    is_pageable_host_pointer(dst)));
 }
 
 cudaError_t cudaMemset2D(void* dev_ptr, size_t pitch,
@@ -3144,6 +3196,23 @@ cudaError_t cudaStreamIsCapturing(cudaStream_t stream,
     return fail(cudaSuccess);
 }
 
+// Copy the launch arguments into the node. Sizes come from the kernel's registered ABI, so an
+// unregistered kernel cannot be recorded — the same condition would make a direct launch fail.
+static cudaError_t record_kernel_args(cudaGraphNode_st* node, const void* func, void** args) {
+    cumetal::registration::RegisteredKernel registered_kernel;
+    if (!cumetal::native_registration::lookup_kernel(func, &registered_kernel) &&
+        !cumetal::registration::lookup_registered_kernel(func, &registered_kernel)) {
+        return cudaErrorInvalidDeviceFunction;
+    }
+    node->arg_values.clear();
+    node->arg_values.reserve(registered_kernel.arg_info.size());
+    for (std::size_t i = 0; i < registered_kernel.arg_info.size(); ++i) {
+        const auto* bytes = static_cast<const std::uint8_t*>(args[i]);
+        node->arg_values.emplace_back(bytes, bytes + registered_kernel.arg_info[i].size_bytes);
+    }
+    return cudaSuccess;
+}
+
 cudaError_t cudaGraphCreate(cudaGraph_t* pGraph, unsigned int /*flags*/) {
     if (pGraph == nullptr) {
         return fail(cudaErrorInvalidValue);
@@ -3161,18 +3230,59 @@ cudaError_t cudaGraphDestroy(cudaGraph_t graph) {
 }
 
 cudaError_t cudaGraphInstantiate(cudaGraphExec_t* pGraphExec, cudaGraph_t graph,
-                                  cudaGraphNode_t* pErrorNode, char* /*pLogBuffer*/,
-                                  size_t /*bufferSize*/) {
+                                  unsigned long long /*flags*/) {
     if (pGraphExec == nullptr || graph == nullptr) {
         return fail(cudaErrorInvalidValue);
     }
-    if (pErrorNode) { *pErrorNode = nullptr; }
 
     auto* exec = new cudaGraphExec_st();
     for (const auto* node : graph->nodes) {
         exec->nodes.push_back(*node);
     }
     *pGraphExec = exec;
+    return fail(cudaSuccess);
+}
+
+cudaError_t cudaGraphInstantiateWithFlags(cudaGraphExec_t* pGraphExec, cudaGraph_t graph,
+                                           unsigned long long flags) {
+    return cudaGraphInstantiate(pGraphExec, graph, flags);
+}
+
+// Re-point an instantiated graph at a newly captured one. CUDA only permits this when the two are
+// topologically identical, which for the flat node list here means same length, same node types and
+// same kernel functions; only the recorded parameter values may differ.
+cudaError_t cudaGraphExecUpdate(cudaGraphExec_t hGraphExec, cudaGraph_t hGraph,
+                                 cudaGraphExecUpdateResultInfo* resultInfo) {
+    if (hGraphExec == nullptr || hGraph == nullptr) {
+        return fail(cudaErrorInvalidValue);
+    }
+    if (resultInfo) {
+        *resultInfo = cudaGraphExecUpdateResultInfo{cudaGraphExecUpdateSuccess, nullptr, nullptr};
+    }
+
+    const auto report = [&](cudaGraphExecUpdateResult result, cudaGraphNode_t node) {
+        if (resultInfo) {
+            resultInfo->result = result;
+            resultInfo->errorNode = node;
+        }
+        return fail(cudaErrorGraphExecUpdateFailure);
+    };
+
+    if (hGraphExec->nodes.size() != hGraph->nodes.size()) {
+        return report(cudaGraphExecUpdateErrorTopologyChanged, nullptr);
+    }
+    for (std::size_t i = 0; i < hGraph->nodes.size(); ++i) {
+        if (hGraphExec->nodes[i].type != hGraph->nodes[i]->type) {
+            return report(cudaGraphExecUpdateErrorNodeTypeChanged, hGraph->nodes[i]);
+        }
+        if (hGraphExec->nodes[i].type == cudaGraphNodeTypeKernel &&
+            hGraphExec->nodes[i].func != hGraph->nodes[i]->func) {
+            return report(cudaGraphExecUpdateErrorFunctionChanged, hGraph->nodes[i]);
+        }
+    }
+    for (std::size_t i = 0; i < hGraph->nodes.size(); ++i) {
+        hGraphExec->nodes[i] = *hGraph->nodes[i];
+    }
     return fail(cudaSuccess);
 }
 
@@ -3184,10 +3294,16 @@ cudaError_t cudaGraphLaunch(cudaGraphExec_t graphExec, cudaStream_t stream) {
     for (const auto& node : graphExec->nodes) {
         cudaError_t err = cudaSuccess;
         switch (node.type) {
-            case cudaGraphNodeTypeKernel:
+            case cudaGraphNodeTypeKernel: {
+                std::vector<void*> arg_ptrs;
+                arg_ptrs.reserve(node.arg_values.size());
+                for (const auto& value : node.arg_values) {
+                    arg_ptrs.push_back(const_cast<std::uint8_t*>(value.data()));
+                }
                 err = cudaLaunchKernel(node.func, node.grid_dim, node.block_dim,
-                                        node.kernel_args, node.shared_mem, stream);
+                                        arg_ptrs.data(), node.shared_mem, stream);
                 break;
+            }
             case cudaGraphNodeTypeMemcpy:
                 err = cudaMemcpyAsync(node.dst, node.src, node.count, node.memcpy_kind, stream);
                 break;
@@ -3249,8 +3365,13 @@ cudaError_t cudaGraphAddKernelNode(cudaGraphNode_t* pGraphNode, cudaGraph_t grap
     node->func = pNodeParams->func;
     node->grid_dim = pNodeParams->gridDim;
     node->block_dim = pNodeParams->blockDim;
-    node->kernel_args = pNodeParams->kernelParams;
     node->shared_mem = pNodeParams->sharedMemBytes;
+    const cudaError_t record_status =
+        record_kernel_args(node, pNodeParams->func, pNodeParams->kernelParams);
+    if (record_status != cudaSuccess) {
+        delete node;
+        return fail(record_status);
+    }
     graph->nodes.push_back(node);
     *pGraphNode = node;
     return fail(cudaSuccess);
@@ -3555,8 +3676,12 @@ cudaError_t cudaLaunchKernel(const void* func,
         node->func = func;
         node->grid_dim = grid_dim;
         node->block_dim = block_dim;
-        node->kernel_args = args;
         node->shared_mem = shared_mem;
+        const cudaError_t record_status = record_kernel_args(node, func, args);
+        if (record_status != cudaSuccess) {
+            delete node;
+            return launch_fail(record_status, "graph capture: kernel not registered");
+        }
         g->nodes.push_back(node);
         return fail(cudaSuccess);
     }
@@ -4002,13 +4127,64 @@ cudaError_t cudaLaunchKernel(const void* func,
         }
     }
 
-    // Use the user-specified dynamic shared memory size; fall back to the static
-    // shared memory size computed from the PTX .shared declarations (for kernels
-    // that use static __shared__ arrays without any dynamic shared memory).
+    // Append hidden constant-buffer args for runtime-written __constant__ symbols, matching the
+    // trailing kernel parameters the PTX lowering emits for them.
+    if (use_registered_kernel) {
+        for (const std::string& symbol : registered_kernel.const_symbol_buffers) {
+            std::shared_ptr<cumetal::metal_backend::Buffer> storage;
+            if (!cumetal::registration::lookup_symbol_storage(symbol, &storage)) {
+                return launch_fail(cudaErrorInvalidDevicePointer, "constant symbol not registered");
+            }
+            cumetal::metal_backend::KernelArg arg;
+            arg.kind = cumetal::metal_backend::KernelArg::Kind::kBuffer;
+            arg.buffer = std::move(storage);
+            arg.offset = 0;
+            launch_args.push_back(std::move(arg));
+        }
+    }
+
+    {
+        static int dump_args = -1;
+        if (dump_args < 0) {
+            const char* v = std::getenv("CUMETAL_DEBUG_LAUNCH");
+            dump_args = (v != nullptr && v[0] == '2') ? 1 : 0;
+        }
+        if (dump_args) {
+            const char* which = use_registered_kernel ? registered_kernel.kernel_name.c_str()
+                                : (kernel != nullptr ? kernel->kernel_name : "<null>");
+            std::fprintf(stderr, "CUMETAL_ARGS: kernel=%s nargs=%zu grid=(%u,%u,%u) block=(%u,%u,%u)\n",
+                         which != nullptr ? which : "<null>", launch_args.size(),
+                         grid_dim.x, grid_dim.y, grid_dim.z,
+                         block_dim.x, block_dim.y, block_dim.z);
+            for (std::size_t k = 0; k < launch_args.size(); ++k) {
+                const auto& a = launch_args[k];
+                if (a.kind == cumetal::metal_backend::KernelArg::Kind::kBuffer) {
+                    std::fprintf(stderr, "  [%zu] buffer contents=%p dev=0x%llx offset=%zu len=%zu\n", k,
+                                 a.buffer != nullptr ? a.buffer->contents() : nullptr,
+                                 a.buffer != nullptr
+                                     ? static_cast<unsigned long long>(a.buffer->device_address())
+                                     : 0ull,
+                                 a.offset,
+                                 a.buffer != nullptr ? a.buffer->length() : 0);
+                } else {
+                    std::uint64_t value = 0;
+                    std::memcpy(&value, a.bytes.data(), std::min(a.bytes.size(), sizeof(value)));
+                    std::fprintf(stderr, "  [%zu] bytes n=%zu head=0x%llx\n", k, a.bytes.size(),
+                                 static_cast<unsigned long long>(value));
+                }
+            }
+        }
+    }
+
+    // A kernel's threadgroup memory holds its static __shared__ objects followed by the dynamic
+    // region the launch asked for, so the two sizes add. The lowering places the extern .shared
+    // base on the 16-byte boundary after the static objects; mirror that padding here.
+    const std::size_t static_shared_bytes = use_registered_kernel
+                                                ? registered_kernel.static_shared_bytes
+                                                : inline_static_shared_bytes;
     const std::size_t effective_shared_mem =
-        (shared_mem > 0) ? shared_mem
-        : (use_registered_kernel ? registered_kernel.static_shared_bytes
-                                 : inline_static_shared_bytes);
+        shared_mem > 0 ? ((static_shared_bytes + 15) & ~static_cast<std::size_t>(15)) + shared_mem
+                       : static_shared_bytes;
 
     cumetal::metal_backend::LaunchConfig config{
         .grid = grid_dim,
@@ -4445,6 +4621,10 @@ const char* cudaGetErrorName(cudaError_t error) {
             return "cudaErrorInvalidDevicePointer";
         case cudaErrorNotReady:
             return "cudaErrorNotReady";
+        case cudaErrorInvalidDeviceFunction:
+            return "cudaErrorInvalidDeviceFunction";
+        case cudaErrorGraphExecUpdateFailure:
+            return "cudaErrorGraphExecUpdateFailure";
         case cudaErrorDevicesUnavailable:
             return "cudaErrorDevicesUnavailable";
         case cudaErrorPeerAccessAlreadyEnabled:
@@ -4477,6 +4657,10 @@ const char* cudaGetErrorString(cudaError_t error) {
             return "cudaErrorInvalidDevicePointer";
         case cudaErrorNotReady:
             return "cudaErrorNotReady";
+        case cudaErrorInvalidDeviceFunction:
+            return "cudaErrorInvalidDeviceFunction";
+        case cudaErrorGraphExecUpdateFailure:
+            return "cudaErrorGraphExecUpdateFailure";
         case cudaErrorDevicesUnavailable:
             return "cudaErrorDevicesUnavailable";
         case cudaErrorPeerAccessAlreadyEnabled:
@@ -5060,29 +5244,71 @@ cudaError_t cudaMemcpyFromArray(void* dst, cudaArray_const_t src, size_t wOffset
 
 namespace {
 std::mutex g_tex_mutex;
-std::unordered_map<cudaTextureObject_t, cudaResourceDesc> g_texture_objects;
 std::unordered_map<cudaSurfaceObject_t, cudaResourceDesc> g_surface_objects;
-cudaTextureObject_t g_next_tex_id = 1;
 cudaSurfaceObject_t g_next_surf_id = 1;
 }  // namespace
 
+// A texture object is the device address of a cumetalTextureRecord_t, which tex2D() dereferences on
+// the GPU. See runtime/api/texture_types.h for why this is an address rather than an opaque id.
 cudaError_t cudaCreateTextureObject(cudaTextureObject_t* pTexObject,
                                      const cudaResourceDesc* pResDesc,
-                                     const cudaTextureDesc* /*pTexDesc*/,
+                                     const cudaTextureDesc* pTexDesc,
                                      const cudaResourceViewDesc* /*pResViewDesc*/) {
     if (pTexObject == nullptr || pResDesc == nullptr) {
         return fail(cudaErrorInvalidValue);
     }
-    std::lock_guard<std::mutex> lock(g_tex_mutex);
-    *pTexObject = g_next_tex_id++;
-    g_texture_objects[*pTexObject] = *pResDesc;
+    cumetalTextureRecord_t record{};
+    if (pResDesc->resType == cudaResourceDesc::cudaResourceTypePitch2D) {
+        const auto& pitch2D = pResDesc->res.pitch2D;
+        record.data = pitch2D.devPtr;
+        record.width = static_cast<unsigned int>(pitch2D.width);
+        record.height = static_cast<unsigned int>(pitch2D.height);
+        record.pitch_bytes = static_cast<unsigned int>(pitch2D.pitchInBytes);
+        record.channel_bits = pitch2D.desc.x;
+        record.channel_kind = static_cast<int>(pitch2D.desc.f);
+    } else if (pResDesc->resType == cudaResourceDesc::cudaResourceTypeArray) {
+        // cudaMallocArray hands back a densely packed linear allocation, so an array samples
+        // exactly like a pitch2D whose pitch is one row.
+        const auto* array = reinterpret_cast<const CuMetalArray*>(pResDesc->res.array.array);
+        if (array == nullptr) {
+            return fail(cudaErrorInvalidValue);
+        }
+        const unsigned int element_bytes = static_cast<unsigned int>(
+            (array->desc.x + array->desc.y + array->desc.z + array->desc.w + 7) / 8);
+        record.data = array->data;
+        record.width = static_cast<unsigned int>(array->width);
+        record.height = static_cast<unsigned int>(array->height);
+        record.pitch_bytes = static_cast<unsigned int>(array->width) * element_bytes;
+        record.channel_bits = array->desc.x;
+        record.channel_kind = static_cast<int>(array->desc.f);
+    } else {
+        return fail(cudaErrorNotSupported);
+    }
+
+    if (pTexDesc != nullptr) {
+        record.filter_linear = pTexDesc->filterMode == cudaFilterModeLinear ? 1 : 0;
+        record.normalized_coords = pTexDesc->normalizedCoords;
+    }
+
+    void* device_record = nullptr;
+    cudaError_t err = cudaMalloc(&device_record, sizeof(record));
+    if (err != cudaSuccess) {
+        return err;
+    }
+    err = cudaMemcpy(device_record, &record, sizeof(record), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        cudaFree(device_record);
+        return err;
+    }
+    *pTexObject = reinterpret_cast<cudaTextureObject_t>(device_record);
     return fail(cudaSuccess);
 }
 
 cudaError_t cudaDestroyTextureObject(cudaTextureObject_t texObject) {
-    std::lock_guard<std::mutex> lock(g_tex_mutex);
-    g_texture_objects.erase(texObject);
-    return fail(cudaSuccess);
+    if (texObject == 0) {
+        return fail(cudaSuccess);
+    }
+    return cudaFree(reinterpret_cast<void*>(texObject));
 }
 
 cudaError_t cudaCreateSurfaceObject(cudaSurfaceObject_t* pSurfObject,

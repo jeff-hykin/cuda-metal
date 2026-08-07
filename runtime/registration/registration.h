@@ -3,9 +3,14 @@
 #include "cuda_runtime.h"
 
 #include <cstddef>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
+
+namespace cumetal::metal_backend {
+class Buffer;
+}
 
 namespace cumetal::registration {
 
@@ -19,6 +24,9 @@ struct RegisteredKernel {
     // Total bytes of static __shared__ memory (non-extern .shared declarations).
     // Used to call setThreadgroupMemoryLength when no dynamic shared memory is specified.
     std::size_t static_shared_bytes = 0;
+    // Runtime-written __constant__ symbols this kernel reads, in the order of the hidden
+    // constant-buffer arguments the PTX lowering appends after the explicit kernel arguments.
+    std::vector<std::string> const_symbol_buffers;
     std::string provenance;
     std::string semantic_quality;
 };
@@ -46,6 +54,11 @@ bool lookup_registered_kernel(const void* host_function, RegisteredKernel* out);
 bool lookup_registered_symbol(const void* host_symbol,
                               const void** out_device_symbol,
                               std::size_t* out_size);
+
+// Device storage allocated for a __constant__ symbol at registration time, keyed by the
+// mangled device name the PTX uses. The launch path binds this as a hidden kernel argument.
+bool lookup_symbol_storage(const std::string& device_name,
+                           std::shared_ptr<cumetal::metal_backend::Buffer>* out);
 void clear();
 
 }  // namespace cumetal::registration
