@@ -61,6 +61,17 @@ bool lookup_symbol_storage(const std::string& device_name,
                            std::shared_ptr<cumetal::metal_backend::Buffer>* out);
 void clear();
 
+struct PrewarmResult {
+    std::size_t total = 0;
+    std::size_t lowered = 0;
+    std::vector<std::string> failed;
+};
+
+// Lower every registered kernel into the persistent JIT cache, not just the ones a given run
+// happens to launch. Packaging uses this so a shipped cache covers every code path (IMU,
+// depth, RGB inputs) instead of whichever branches the sample data took.
+PrewarmResult prewarm_all_registered_kernels();
+
 }  // namespace cumetal::registration
 
 extern "C" {

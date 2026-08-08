@@ -235,6 +235,32 @@ std::filesystem::path jit_cache_root() {
     return std::filesystem::temp_directory_path() / "io.cumetal" / "registration-jit";
 }
 
+// Read-only cache directories searched when the writable cache misses, taken from
+// CUMETAL_PREBUILT_CACHE_DIR (colon-separated). A redistributed package ships its kernels
+// this way: its install root is not writable, so the metallibs cannot live in the normal
+// cache, but the cache key is reproducible across machines and the writable cache still
+// absorbs anything the package did not precompile.
+std::vector<std::filesystem::path> prebuilt_cache_roots() {
+    const char* configured = std::getenv("CUMETAL_PREBUILT_CACHE_DIR");
+    if (configured == nullptr || configured[0] == '\0') {
+        return {};
+    }
+    std::vector<std::filesystem::path> roots;
+    std::string_view remaining(configured);
+    while (!remaining.empty()) {
+        const std::size_t separator = remaining.find(':');
+        const std::string_view entry = remaining.substr(0, separator);
+        if (!entry.empty()) {
+            roots.emplace_back(entry);
+        }
+        if (separator == std::string_view::npos) {
+            break;
+        }
+        remaining.remove_prefix(separator + 1);
+    }
+    return roots;
+}
+
 // Returns the persistent cache path for a (ptx_source, kernel_name) pair.
 // Returns an empty path if the cache directory cannot be created.
 std::filesystem::path jit_cache_path_for(std::uint64_t prefix_hash,
@@ -940,6 +966,25 @@ bool emit_ptx_entry_to_temp_metallib(const std::string& ptx_source,
         REG_DEBUG("jit cache miss: %s", cached_metallib.c_str());
     }
 
+    // ── Read-only prebuilt cache lookup ───────────────────────────────────
+    // Same key, directories the process may not write to. This is what lets an installed
+    // package run on a machine with no Metal compiler at all.
+    {
+        const std::string key = jit_cache_key(cache_prefix_hash, kernel_name);
+        for (const std::filesystem::path& root : prebuilt_cache_roots()) {
+            std::error_code ec;
+            for (const char* extension : {".metallib", ".metal"}) {
+                const std::filesystem::path candidate = root / (key + extension);
+                if (std::filesystem::exists(candidate, ec) && !ec) {
+                    REG_DEBUG("prebuilt cache hit: %s", candidate.c_str());
+                    *out_path = candidate.string();
+                    if (out_is_persistent != nullptr) *out_is_persistent = true;
+                    return true;
+                }
+            }
+        }
+    }
+
     // ── Compilation ───────────────────────────────────────────────────────
     // Use a timestamp-based name for intermediate files (ll/metal) that are
     // cleaned up immediately.  The final metallib lands in the persistent cache.
@@ -1365,6 +1410,37 @@ void clear() {
         tls_launch_stack.clear();
     }
     remove_owned_metallibs(owned);
+}
+
+PrewarmResult prewarm_all_registered_kernels() {
+    std::vector<std::pair<void*, std::string>> pending;
+    {
+        RegistrationState& s = state();
+        std::lock_guard<std::mutex> lock(s.mutex);
+        pending.reserve(s.kernels.size());
+        for (const auto& [host_function, record] : s.kernels) {
+            (void)host_function;
+            if (record.module_handle != nullptr && !record.kernel_name.empty()) {
+                pending.emplace_back(record.module_handle, record.kernel_name);
+            }
+        }
+    }
+
+    PrewarmResult result;
+    result.total = pending.size();
+    for (const auto& [module_handle, kernel_name] : pending) {
+        std::vector<std::string> printf_formats;
+        std::size_t static_shared = 0;
+        const std::string path = resolve_metallib_path_for_kernel(
+            module_handle, kernel_name, &printf_formats, &static_shared);
+        std::error_code ec;
+        if (path.empty() || !std::filesystem::exists(path, ec) || ec) {
+            result.failed.push_back(kernel_name);
+        } else {
+            ++result.lowered;
+        }
+    }
+    return result;
 }
 
 }  // namespace cumetal::registration

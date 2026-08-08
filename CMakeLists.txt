@@ -486,6 +486,22 @@ target_compile_options(ptx_diff
         -Wpedantic
 )
 
+add_executable(cumetal_prewarm
+    tools/cumetal_prewarm/main.cpp
+)
+
+target_link_libraries(cumetal_prewarm
+    PRIVATE
+        cumetal_runtime
+)
+
+target_compile_options(cumetal_prewarm
+    PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+)
+
 add_executable(cumetal_bench
     tools/cumetal_bench/main.cpp
 )
@@ -576,6 +592,7 @@ install(TARGETS
     cumetal-ptx2llvm
     ptx_diff
     cumetal_bench
+    cumetal_prewarm
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
