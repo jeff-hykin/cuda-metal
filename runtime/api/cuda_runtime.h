@@ -1058,6 +1058,25 @@ static __device__ __host__ __forceinline__ unsigned int min(unsigned int a, unsi
     return a < b ? a : b;
 }
 
+// CUDA also overloads the mixed-sign pairs, converting the signed operand to unsigned. Without
+// them `min(int, unsigned)` is ambiguous between the int and unsigned overloads rather than
+// resolving the way it does under nvcc.
+static __device__ __host__ __forceinline__ unsigned int max(int a, unsigned int b) {
+    return max(static_cast<unsigned int>(a), b);
+}
+
+static __device__ __host__ __forceinline__ unsigned int max(unsigned int a, int b) {
+    return max(a, static_cast<unsigned int>(b));
+}
+
+static __device__ __host__ __forceinline__ unsigned int min(int a, unsigned int b) {
+    return min(static_cast<unsigned int>(a), b);
+}
+
+static __device__ __host__ __forceinline__ unsigned int min(unsigned int a, int b) {
+    return min(a, static_cast<unsigned int>(b));
+}
+
 template <typename T>
 static __device__ __forceinline__ T __ldcs(const T* ptr) {
     return *ptr;
