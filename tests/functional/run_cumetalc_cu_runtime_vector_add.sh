@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../_llvm_ir_support.sh"
 
 CUMETALC="$1"
 TEST_BINARY="$2"
@@ -47,7 +48,7 @@ if ! xcrun --find metallib >/dev/null 2>&1; then
   exit 77
 fi
 
-"$CUMETALC" \
+run_cumetalc_or_skip "$CUMETALC" \
   --backend=cumetal-ir \
   --entry vector_add \
   --mode xcrun \

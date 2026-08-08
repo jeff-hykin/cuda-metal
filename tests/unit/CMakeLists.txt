@@ -388,6 +388,7 @@ add_test(
             ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/switch_normalization.cu
             ${CMAKE_CURRENT_SOURCE_DIR}/fixtures/cuda_float_abs.cu
 )
+set_tests_properties(unit_cumetalc_shared_ir PROPERTIES SKIP_RETURN_CODE 77)
 
 add_test(
     NAME unit_intrinsic_lower

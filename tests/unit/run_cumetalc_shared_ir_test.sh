@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/../_llvm_ir_support.sh"
 
 cumetalc=$1
 ptx=$2
@@ -22,7 +23,7 @@ grep -q 'cumetal-provenance: generic_ptx_lowering' "$workdir/vector.metal"
 grep -q 'cumetal-semantic-quality: exact' "$workdir/vector.metal"
 grep -q 'kernel void vector_add' "$workdir/vector.metal"
 
-"$cumetalc" "$cu" --backend=cumetal-ir --emit=msl \
+run_cumetalc_or_skip "$cumetalc" "$cu" --backend=cumetal-ir --emit=msl \
     --overwrite -o "$workdir/source.metal"
 grep -q 'cumetal-provenance: generic_nvvm_lowering' "$workdir/source.metal"
 grep -q 'kernel void vector_add' "$workdir/source.metal"

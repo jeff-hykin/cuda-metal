@@ -1,5 +1,4 @@
-/build/
-/build-*/
+/build*/
 /Testing/
 tools/metal_library_archive_bridge/.build/
 tools/metal_library_archive_bridge/.swiftpm/
