@@ -502,7 +502,9 @@ bool ensure_initialized(std::string* error_message) {
             }
             return false;
         }
-        {
+        // Residency sets arrived in macOS 15. Every reader of backend.residency_set already treats
+        // nil as "unavailable", so an older system just keeps per-allocation residency.
+        if (@available(macOS 15.0, *)) {
             MTLResidencySetDescriptor* residency_desc = [[MTLResidencySetDescriptor alloc] init];
             residency_desc.initialCapacity = 4096;
             NSError* residency_error = nil;

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -16,6 +17,28 @@
 #include <vector>
 
 namespace cumetal::ptx {
+
+MetalTargetVersions metal_target_versions(std::string_view macos_deployment_target) {
+    const std::size_t dot = macos_deployment_target.find('.');
+    const std::size_t major_len =
+        dot == std::string_view::npos ? macos_deployment_target.size() : dot;
+    int major = 0;
+    std::from_chars(macos_deployment_target.data(),
+                    macos_deployment_target.data() + major_len, major);
+
+    MetalTargetVersions versions{8, 4, 0, {}};  // macOS 26 and newer
+    switch (major) {
+        case 13: versions = {5, 3, 0, {}}; break;
+        case 14: versions = {6, 3, 1, {}}; break;
+        case 15: versions = {7, 3, 2, {}}; break;
+        default: break;
+    }
+    // air64_v25 pairs with AIR 2.5, v26 with 2.6, and so on.
+    versions.triple = "air64_v" + std::to_string(20 + versions.air_minor) + "-apple-macosx" +
+                      std::string(macos_deployment_target) + ".0";
+    return versions;
+}
+
 namespace {
 
 struct ParamInfo {
@@ -5176,9 +5199,16 @@ std::vector<std::string> runtime_const_symbols_for_entry(std::string_view ptx,
 LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx, const LowerToLlvmOptions& options) {
     LowerToLlvmResult result;
 
+    const MetalTargetVersions target_versions =
+        metal_target_versions(options.macos_deployment_target);
+
     cumetal::passes::Phase1PipelineOptions pipeline_options;
     pipeline_options.strict = options.strict;
     pipeline_options.entry_name = options.entry_name;
+    pipeline_options.metadata.air_version = "2." + std::to_string(target_versions.air_minor);
+    pipeline_options.metadata.language_version =
+        std::to_string(target_versions.language_major) + "." +
+        std::to_string(target_versions.language_minor);
     const auto pipeline = cumetal::passes::run_phase1_pipeline(ptx, pipeline_options);
     if (!pipeline.ok) {
         result.error = pipeline.error;
@@ -5245,13 +5275,13 @@ LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx, const LowerToLlvmOp
     // Deleting them costs nothing: the generic path lowers all of it. Caught by ptx_sweep_numeric.
     //
     int air_major = 2;
-    int air_minor = 8;
+    int air_minor = target_versions.air_minor;
     if (const auto it = fields.find("air.version"); it != fields.end()) {
         (void)parse_major_minor(it->second, &air_major, &air_minor);
     }
 
-    int language_major = 4;
-    int language_minor = 0;
+    int language_major = target_versions.language_major;
+    int language_minor = target_versions.language_minor;
     if (const auto it = fields.find("language.version"); it != fields.end()) {
         (void)parse_major_minor(it->second, &language_major, &language_minor);
     }
@@ -5323,7 +5353,9 @@ LowerToLlvmResult lower_ptx_to_llvm_ir(std::string_view ptx, const LowerToLlvmOp
 
     std::ostringstream ir;
     ir << "; ModuleID = '" << options.module_id << "'\n";
-    ir << "target triple = \"" << options.target_triple << "\"\n\n";
+    ir << "target triple = \""
+       << (options.target_triple.empty() ? target_versions.triple : options.target_triple)
+       << "\"\n\n";
     ir << "define void @" << pipeline.entry_name << "(";
     for (std::size_t i = 0; i < arg_decls.size(); ++i) {
         if (i > 0) {

@@ -113,6 +113,14 @@ const std::string& cumetal_binary_uuid() {
     return uuid;
 }
 
+// Oldest macOS the JIT-produced metallibs will load on. A metallib built for a newer OS than the
+// one running is rejected by Metal, so a cache shipped with a package must be built for the oldest
+// OS it claims to support.
+std::string registration_macos_deployment_target() {
+    const char* target = std::getenv("CUMETAL_MACOS_DEPLOYMENT_TARGET");
+    return target != nullptr && target[0] != '\0' ? std::string(target) : std::string("13.0");
+}
+
 std::string registration_lowering_policy() {
     const char* backend = std::getenv("CUMETAL_PTX_BACKEND");
     const char* fp64 = std::getenv("CUMETAL_FP64_MODE");
@@ -128,6 +136,9 @@ std::string registration_lowering_policy() {
     policy += cumetal::metal_math_mode_name(
         cumetal::current_metal_math_mode());
     policy += ";ir_schema=1;metal_legalization=1;msl=3.1";
+    // Part of the key: two runs at different deployment targets produce different metallibs,
+    // and a prewarmed cache must not be handed to a runtime asking for a different target.
+    policy += ";macos_min=" + registration_macos_deployment_target();
     return policy;
 }
 
@@ -949,6 +960,7 @@ bool emit_ptx_entry_to_temp_metallib(const std::string& ptx_source,
     emit_options.validate_output = true;
     emit_options.fallback_to_experimental = true;
     emit_options.kernel_name = kernel_name;
+    emit_options.macos_deployment_target = registration_macos_deployment_target();
 
     std::string io_error;
     cumetal::ptx::LowerToMetalOptions lower_to_metal_options;
@@ -1009,6 +1021,7 @@ bool emit_ptx_entry_to_temp_metallib(const std::string& ptx_source,
         cumetal::ptx::LowerToLlvmOptions lower_options;
         lower_options.entry_name = kernel_name;
         lower_options.strict = true;
+        lower_options.macos_deployment_target = registration_macos_deployment_target();
         const auto lowered = cumetal::ptx::lower_ptx_to_llvm_ir(ptx_source, lower_options);
         if (!lowered.ok || lowered.llvm_ir.empty()) {
             if (!lowered.error.empty()) {

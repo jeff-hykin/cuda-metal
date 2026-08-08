@@ -13,11 +13,27 @@ enum class Fp64Mode {
     kWarn,     // same as kNative but emit a per-instruction warning for .f64 ops
 };
 
+// The AIR and Metal Shading Language versions a given macOS release's driver accepts.
+// Apple renumbered 15 -> 26, so there is no 16..25.
+struct MetalTargetVersions {
+    int air_minor;
+    int language_major;
+    int language_minor;
+    std::string triple;  // e.g. air64_v25-apple-macosx13.0.0
+};
+
+MetalTargetVersions metal_target_versions(std::string_view macos_deployment_target);
+
 struct LowerToLlvmOptions {
     bool strict = false;
     std::string entry_name;
     std::string module_id = "cumetal.ptx.module";
-    std::string target_triple = "air64_v28-apple-macosx26.0.0";
+    // Oldest macOS the emitted AIR will load on. Metal rejects a metallib whose AIR version
+    // is newer than the running OS, so emitting the newest (the SDK default) would pin every
+    // compiled kernel — and any cache shipped with a package — to the build machine's macOS.
+    std::string macos_deployment_target = "13.0";
+    // Overrides the triple derived from the deployment target. Empty means derive it.
+    std::string target_triple;
     Fp64Mode fp64_mode = Fp64Mode::kNative;
 };
 

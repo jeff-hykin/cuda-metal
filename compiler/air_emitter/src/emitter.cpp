@@ -518,6 +518,11 @@ EmitResult emit_with_xcrun(const EmitOptions& options) {
     EmitResult result;
     result.mode_used = EmitMode::kXcrun;
 
+    const std::string version_min =
+        options.macos_deployment_target.empty()
+            ? std::string()
+            : " -mmacosx-version-min=" + options.macos_deployment_target;
+
     if (!std::filesystem::exists(options.input)) {
         result.error = "input file does not exist: " + options.input.string();
         return result;
@@ -537,8 +542,9 @@ EmitResult emit_with_xcrun(const EmitOptions& options) {
     } else if (extension == ".metal") {
         const std::string xcrun_for_metal = find_tool("xcrun");
         const std::string xcrun_metal_bin = xcrun_for_metal.empty() ? "xcrun" : xcrun_for_metal;
-        const std::string command = xcrun_metal_bin + " metal -c " + quote_shell(options.input.string()) +
-                                    " -o " + quote_shell(temp_air.string()) + " 2>&1";
+        const std::string command = xcrun_metal_bin + " metal" + version_min + " -c " +
+                                    quote_shell(options.input.string()) + " -o " +
+                                    quote_shell(temp_air.string()) + " 2>&1";
         const CommandResult cmd = run_command_capture(command);
         result.logs.push_back("$ " + command);
         result.logs.push_back(cmd.output);
@@ -556,7 +562,8 @@ EmitResult emit_with_xcrun(const EmitOptions& options) {
             const std::string xcrun_path = find_tool("xcrun");
             const std::string xcrun_bin = xcrun_path.empty() ? "xcrun" : xcrun_path;
             // Full AOT compilation: metal input.ll -o output.metallib (no -c flag)
-            const std::string command = xcrun_bin + " metal " + quote_shell(options.input.string()) + " -o " +
+            const std::string command = xcrun_bin + " metal" + version_min + " " +
+                                        quote_shell(options.input.string()) + " -o " +
                                         quote_shell(options.output.string()) + " 2>&1";
             const CommandResult cmd = run_command_capture(command);
             result.logs.push_back("$ " + command);
@@ -570,7 +577,8 @@ EmitResult emit_with_xcrun(const EmitOptions& options) {
             }
             // AOT compilation failed — fall back to Air bitcode path
             result.logs.push_back("xcrun metal AOT failed, falling back to Air bitcode path");
-            const std::string fallback_cmd = xcrun_bin + " metal -c " + quote_shell(options.input.string()) + " -o " +
+            const std::string fallback_cmd = xcrun_bin + " metal" + version_min + " -c " +
+                                             quote_shell(options.input.string()) + " -o " +
                                              quote_shell(temp_air.string()) + " 2>&1";
             const CommandResult fallback = run_command_capture(fallback_cmd);
             result.logs.push_back("$ " + fallback_cmd);
