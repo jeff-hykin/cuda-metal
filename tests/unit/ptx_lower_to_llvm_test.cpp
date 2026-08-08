@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <string>
+#include <tuple>
+#include <vector>
 
 namespace {
 
@@ -97,7 +99,12 @@ int main() {
     if (!expect(contains(lowered.llvm_ir, "\"air.kernel\""), "air.kernel attribute emitted")) {
         return 1;
     }
-    if (!expect(contains(lowered.llvm_ir, "\"air.version\"=\"2.8\""), "air.version emitted")) {
+    if (!expect(contains(lowered.llvm_ir, "\"air.version\"=\"2.5\""),
+                "air.version follows the default macOS 13 deployment target")) {
+        return 1;
+    }
+    if (!expect(contains(lowered.llvm_ir, "target triple = \"air64_v25-apple-macosx13.0.0\""),
+                "triple follows the default macOS 13 deployment target")) {
         return 1;
     }
     if (!expect(contains(lowered.llvm_ir, "!air.language_version = !{!"),
@@ -106,6 +113,25 @@ int main() {
     }
     if (!expect(lowered.warnings.empty(), "no warnings for supported vector-add lowering path")) {
         return 1;
+    }
+
+    // air-lld rejects a module whose air.version disagrees with the target it is compiled for,
+    // so the triple and the version metadata have to move together with the deployment target.
+    for (const auto& [target, triple, air, language] :
+         std::vector<std::tuple<std::string, std::string, std::string, std::string>>{
+             {"14.0", "air64_v26-apple-macosx14.0.0", "2.6", "3, i32 1"},
+             {"15.0", "air64_v27-apple-macosx15.0.0", "2.7", "3, i32 2"},
+             {"26.0", "air64_v28-apple-macosx26.0.0", "2.8", "4, i32 0"}}) {
+        cumetal::ptx::LowerToLlvmOptions targeted;
+        targeted.entry_name = "vector_add";
+        targeted.macos_deployment_target = target;
+        const auto result = cumetal::ptx::lower_ptx_to_llvm_ir(ptx, targeted);
+        if (!expect(result.ok && contains(result.llvm_ir, "target triple = \"" + triple + "\"") &&
+                        contains(result.llvm_ir, "\"air.version\"=\"" + air + "\"") &&
+                        contains(result.llvm_ir, "!{!\"Metal\", i32 " + language + ", i32 0}"),
+                    ("macOS " + target + " lowers to " + triple + " / AIR " + air).c_str())) {
+            return 1;
+        }
     }
 
     // A kernel named `negate` whose body multiplies instead. Under the old name-matched templates

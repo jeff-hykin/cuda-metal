@@ -1141,6 +1141,7 @@ class GenericLlvmEmitter {
     std::unordered_map<int, int> exec_pos_by_instr_index_;
     std::unordered_map<std::string, int> label_to_exec_pos_;
     std::unordered_map<int, int> next_exec_pos_by_exec_pos_;
+    std::unordered_map<std::string, std::vector<std::string>> branch_targets_by_name_;
 
     std::unordered_map<std::string, RegSlot> reg_slots_;
     std::unordered_map<std::string, PointerAs> reg_pointer_as_;
@@ -1685,8 +1686,17 @@ class GenericLlvmEmitter {
 
     bool index_control_flow() {
         exec_indices_.clear();
+        branch_targets_by_name_.clear();
         for (int i = 0; i < static_cast<int>(entry_.instructions.size()); ++i) {
-            if (entry_.instructions[static_cast<std::size_t>(i)].opcode == "ptx.label") {
+            const auto& candidate = entry_.instructions[static_cast<std::size_t>(i)];
+            if (candidate.opcode == "ptx.label") {
+                continue;
+            }
+            if (candidate.opcode == "ptx.branchtargets") {
+                if (!candidate.operands.empty()) {
+                    branch_targets_by_name_[candidate.operands[0]] =
+                        std::vector<std::string>(candidate.operands.begin() + 1, candidate.operands.end());
+                }
                 continue;
             }
             exec_pos_by_instr_index_[i] = static_cast<int>(exec_indices_.size());
@@ -4918,6 +4928,42 @@ class GenericLlvmEmitter {
         return true;
     }
 
+    // brx.idx %r, $L_brx_0; jumps to the entry of $L_brx_0's .branchtargets list selected by %r.
+    // PTX leaves an out-of-range index undefined and the emitters range-check it beforehand, so the
+    // switch default can be the first target rather than a separate unreachable block.
+    bool emit_brx(std::ostringstream& os,
+                  const cumetal::ptx::EntryFunction::Instruction& instr,
+                  bool* out_terminated) {
+        if (instr.operands.size() < 2) return fail(instr, "brx.idx expects an index and a target table");
+        const auto table = branch_targets_by_name_.find(instr.operands[1]);
+        if (table == branch_targets_by_name_.end()) {
+            return fail(instr, "unknown branch target table '" + instr.operands[1] + "'");
+        }
+        if (table->second.empty()) {
+            return fail(instr, "empty branch target table '" + instr.operands[1] + "'");
+        }
+
+        std::vector<int> target_positions;
+        for (const std::string& target_label : table->second) {
+            const auto target = label_to_exec_pos_.find(target_label);
+            if (target == label_to_exec_pos_.end()) {
+                return fail(instr, "unknown branch target '" + target_label + "'");
+            }
+            target_positions.push_back(target->second);
+        }
+
+        const std::string index = emit_load_reg_bits(os, instr.operands[0], 32);
+        os << "  switch " << llvm_int_type(ensure_reg_slot(instr.operands[0]).bits) << " " << index
+           << ", label %" << block_name_for_exec_pos(target_positions[0]) << " [\n";
+        for (std::size_t i = 0; i < target_positions.size(); ++i) {
+            os << "    " << llvm_int_type(ensure_reg_slot(instr.operands[0]).bits) << " " << i
+               << ", label %" << block_name_for_exec_pos(target_positions[i]) << "\n";
+        }
+        os << "  ]\n";
+        *out_terminated = true;
+        return true;
+    }
+
     bool fail(const cumetal::ptx::EntryFunction::Instruction& instr, const std::string& msg) {
         error_ = "generic llvm lowering: line " + std::to_string(instr.line) + " opcode '" + instr.opcode + "': " + msg;
         return false;
@@ -4941,6 +4987,9 @@ class GenericLlvmEmitter {
         }
         if (root == "bra") {
             return emit_branch(os, instr, exec_pos, out_terminated);
+        }
+        if (root == "brx") {
+            return emit_brx(os, instr, out_terminated);
         }
         if (root == "mov") {
             return emit_mov_instruction(os, instr);

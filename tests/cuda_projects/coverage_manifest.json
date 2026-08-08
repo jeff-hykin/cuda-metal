@@ -78,6 +78,14 @@
       "binary": "rtiow",
       "harness": "strict",
       "expect_pattern": "OK: GPU render matches CPU reference."
+    },
+    {
+      "name": "indirect_branch",
+      "subdir": "indirect_branch",
+      "source": "switch_jump_table.cu",
+      "binary": "switch_jump_table",
+      "harness": "strict",
+      "expect_pattern": "PASS: PTX indirect branch selects the right target"
     }
   ]
 }

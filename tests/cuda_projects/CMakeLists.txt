@@ -116,6 +116,25 @@ set_tests_properties(
 )
 
 add_test(
+    NAME functional_cuda_projects_indirect_branch
+    COMMAND bash
+        ${CMAKE_CURRENT_SOURCE_DIR}/run_strict_standalone_cu.sh
+        ${CMAKE_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
+        indirect_branch
+        switch_jump_table.cu
+        switch_jump_table
+        "PASS: PTX indirect branch selects the right target"
+)
+set_tests_properties(
+    functional_cuda_projects_indirect_branch
+    PROPERTIES
+        SKIP_RETURN_CODE 77
+        RUN_SERIAL TRUE
+        ENVIRONMENT "CUMETAL_BUILD_DIR=${CMAKE_BINARY_DIR}"
+)
+
+add_test(
     NAME functional_cuda_projects_ggml_output_ops
     COMMAND bash
         ${CMAKE_CURRENT_SOURCE_DIR}/run_strict_standalone_cu.sh

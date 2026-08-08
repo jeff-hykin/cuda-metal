@@ -128,7 +128,7 @@ bool is_supported_opcode(const std::string& opcode) {
 
     static const std::unordered_set<std::string> kSupportedRoots = {
         "abs",       "activemask", "add",       "and",   "atom",  "bar",      "bfe",   "bfi",
-        "bfind",     "bra",        "brev",      "call",  "clz",   "cos",      "cp",    "cvt",
+        "bfind",     "bra",        "brev",      "brx",   "call",  "clz",   "cos",   "cp",    "cvt",
         "cvta",      "div",        "ex2",       "exit",  "fma",   "fns",      "isspacep",
         "ld",        "lg2",        "lop3",      "mad",   "match", "max",      "membar","min",
         "mov",       "mul",        "nanosleep", "neg",   "not",   "or",       "popc",  "prmt",
@@ -534,6 +534,35 @@ void parse_instructions(const std::string& body,
             line_text = trim(line_text.substr(semi + 1));
         }
         if (line_text.empty()) {
+            continue;
+        }
+
+        // A branch-target table introducing an indirect branch:
+        //     $L_brx_0: .branchtargets
+        //         $L__BB10_19,
+        //         ...
+        //         $L__BB10_25;
+        // The list may also sit on the declaring line. It is a declaration, not a label, so
+        // record the ordered targets for the brx.idx that consumes them.
+        static constexpr std::string_view kBranchTargets = ".branchtargets";
+        if (const std::size_t targets_at = line_text.find(kBranchTargets);
+            targets_at != std::string::npos && line_text.find(':') < targets_at) {
+            EntryFunction::Instruction table;
+            table.line = current_line;
+            table.opcode = "ptx.branchtargets";
+            table.supported = true;
+            table.operands.push_back(trim(line_text.substr(0, line_text.find(':'))));
+
+            std::string list = trim(line_text.substr(targets_at + kBranchTargets.size()));
+            while (list.find(';') == std::string::npos && std::getline(stream, raw_line)) {
+                ++line;
+                list += " " + trim(raw_line);
+            }
+            list = list.substr(0, list.find(';'));
+            for (std::string& target : split_operands(list)) {
+                table.operands.push_back(std::move(target));
+            }
+            entry->instructions.push_back(std::move(table));
             continue;
         }
 
