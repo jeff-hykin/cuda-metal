@@ -2769,6 +2769,12 @@ add_test(
     NAME functional_texture_surface_api
     COMMAND cumetal_texture_surface_api_test
 )
+# A texture handle is a device address the kernel dereferences, so it only resolves under the
+# Metal device address mapping. cudaCreateTextureObject now refuses the handle without it rather
+# than returning one that samples as zeros.
+set_tests_properties(functional_texture_surface_api PROPERTIES
+    ENVIRONMENT "CUMETAL_USE_METAL_DEVICE_ADDRESSES=1"
+)
 
 add_test(
     NAME functional_cublaslt_api

@@ -2643,6 +2643,29 @@ class GenericLlvmEmitter {
                 const std::string zero = emit_float_constant(os, 0.0f, "fp64_cvt_zero");
                 return store_fp64_pair(os, dst, Fp64Pair{value->ir, zero});
             }
+            if (cvt.dst.kind == PtxTypeSpec::Kind::kFloat && cvt.dst.bits == 64 &&
+                cvt.src.kind == PtxTypeSpec::Kind::kInt && cvt.src.bits <= 32) {
+                // Widened to i64 first so the round-trip below cannot overflow: a 32-bit
+                // magnitude rounded to float stays well inside i64. A 64-bit source could
+                // round up past the i64 range, where fptosi is poison, so it stays rejected.
+                auto value = emit_integer_from_any(os, src, cvt.src.bits, cvt.src.is_signed);
+                if (!value) return fail(instr, "int-to-fp64 conversion source unsupported");
+                const std::string widened = next_tmp("fp64_cvt_wide");
+                os << "  " << widened << " = " << (cvt.src.is_signed ? "sext " : "zext ")
+                   << llvm_int_type(cvt.src.bits) << " " << *value << " to i64\n";
+                const std::string hi = next_tmp("fp64_cvt_hi");
+                os << "  " << hi << " = " << (cvt.src.is_signed ? "sitofp" : "uitofp")
+                   << " i64 " << widened << " to float\n";
+                // Whatever the float32 mantissa could not hold becomes the low limb, so the
+                // pair still carries the full integer.
+                const std::string hi_back = next_tmp("fp64_cvt_hiback");
+                os << "  " << hi_back << " = fptosi float " << hi << " to i64\n";
+                const std::string residual = next_tmp("fp64_cvt_residual");
+                os << "  " << residual << " = sub i64 " << widened << ", " << hi_back << "\n";
+                const std::string lo = next_tmp("fp64_cvt_lo");
+                os << "  " << lo << " = sitofp i64 " << residual << " to float\n";
+                return store_fp64_pair(os, dst, Fp64Pair{hi, lo});
+            }
             return fail(instr,
                         "this fp64 conversion is not supported by FP32-pair emulation");
         }

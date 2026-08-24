@@ -2147,8 +2147,15 @@ cudaError_t cudaMemGetInfo(size_t* free_bytes, size_t* total_bytes) {
 }
 
 cudaError_t cudaMalloc(void** dev_ptr, size_t size) {
-    if (dev_ptr == nullptr || size == 0) {
+    if (dev_ptr == nullptr) {
         return fail(cudaErrorInvalidValue);
+    }
+    // CUDA hands back a null pointer for an empty request rather than an error, and callers rely
+    // on that to keep placeholder buffers they never read. cudaFree(nullptr) is already a no-op,
+    // so the pair round-trips. Metal has no zero-length buffer to hand out.
+    if (size == 0) {
+        *dev_ptr = nullptr;
+        return fail(cudaSuccess);
     }
 
     const cudaError_t init_status = ensure_initialized();
@@ -5256,6 +5263,17 @@ cudaError_t cudaCreateTextureObject(cudaTextureObject_t* pTexObject,
                                      const cudaResourceViewDesc* /*pResViewDesc*/) {
     if (pTexObject == nullptr || pResDesc == nullptr) {
         return fail(cudaErrorInvalidValue);
+    }
+    // A texture object is the device address of a record the kernel dereferences, so under the
+    // default CPU shared mapping the handle is readable by the host and not by the GPU. Sampling
+    // it then yields zeros with no error, which surfaces as plausible-looking empty results far
+    // from here rather than as a failure. Refuse the handle instead, matching the resource-type
+    // rejection below.
+    if (!use_metal_device_addresses()) {
+        cumetal::warn_once("texture-needs-device-addresses",
+                           "cudaCreateTextureObject requires CUMETAL_USE_METAL_DEVICE_ADDRESSES=1; "
+                           "texture handles are dereferenced on the GPU and sample as zeros without it");
+        return fail(cudaErrorNotSupported);
     }
     cumetalTextureRecord_t record{};
     if (pResDesc->resType == cudaResourceDesc::cudaResourceTypePitch2D) {

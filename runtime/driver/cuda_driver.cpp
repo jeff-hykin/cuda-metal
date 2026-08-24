@@ -6,6 +6,7 @@
 #include "cumetal_diag.h"
 #include "cuda_runtime.h"
 #include "fatbin_elf.h"
+#include "fp64_mode.h"
 #include "metal_backend.h"
 #include "module_cache.h"
 
@@ -495,23 +496,12 @@ bool emit_ptx_to_temp_metallib(const std::string& ptx, std::string* out_path) {
         return false;
     }
 
-    // Default to kEmulate: Apple Silicon GPU rejects double-precision ALU ops
+    // Defaults to kEmulate: the Apple Silicon GPU rejects double-precision ALU ops
     // (fmul double, @llvm.fma.f64) at pipeline-creation time even though the
     // xcrun metal compiler accepts them.  kEmulate uses Dekker FP32-pair
     // arithmetic (~44-bit mantissa) which runs on all Apple Silicon hardware.
-    // Set CUMETAL_FP64_MODE=native to force kNative (IEEE 754 double, fails
-    // at runtime on current hardware but useful for testing the compilation path).
     cumetal::ptx::LowerToLlvmOptions lower_opts;
-    lower_opts.fp64_mode = cumetal::ptx::Fp64Mode::kEmulate;
-    const char* fp64_env = std::getenv("CUMETAL_FP64_MODE");
-    if (fp64_env != nullptr) {
-        if (std::string(fp64_env) == "native") {
-            lower_opts.fp64_mode = cumetal::ptx::Fp64Mode::kNative;
-        } else if (std::string(fp64_env) == "warn") {
-            lower_opts.fp64_mode = cumetal::ptx::Fp64Mode::kWarn;
-        }
-        // "emulate" is already the default; any other value is ignored
-    }
+    lower_opts.fp64_mode = cumetal::current_fp64_mode();
     // Emulated FP64 uses Dekker FP32-pair arithmetic (~44-bit mantissa), not full
     // IEEE-754 double. Warn once when a kernel actually contains double-precision
     // ops so numerically sensitive code knows the reduced precision is in effect.

@@ -8,6 +8,7 @@
 #include "cumetal/ptx/parser.h"
 #include "metal_backend.h"
 #include "fatbin_elf.h"
+#include "fp64_mode.h"
 #include "metal_math_mode.h"
 
 #include <dlfcn.h>
@@ -123,11 +124,11 @@ std::string registration_macos_deployment_target() {
 
 std::string registration_lowering_policy() {
     const char* backend = std::getenv("CUMETAL_PTX_BACKEND");
-    const char* fp64 = std::getenv("CUMETAL_FP64_MODE");
     std::string policy = "frontend=ptx;backend=";
     policy += backend != nullptr && backend[0] != '\0' ? backend : "legacy";
     policy += ";fp64=";
-    policy += fp64 != nullptr && fp64[0] != '\0' ? fp64 : "emulate";
+    // Normalized rather than the raw variable, so the key names the mode actually lowered with.
+    policy += cumetal::fp64_mode_name(cumetal::current_fp64_mode());
     policy += ";workload_specializations=";
     policy += cumetal::diag_env_truthy("CUMETAL_ENABLE_WORKLOAD_SPECIALIZATIONS")
                   ? "enabled"
@@ -240,23 +241,51 @@ std::filesystem::path jit_cache_root() {
 // this way: its install root is not writable, so the metallibs cannot live in the normal
 // cache, but the cache key is reproducible across machines and the writable cache still
 // absorbs anything the package did not precompile.
-std::vector<std::filesystem::path> prebuilt_cache_roots() {
-    const char* configured = std::getenv("CUMETAL_PREBUILT_CACHE_DIR");
-    if (configured == nullptr || configured[0] == '\0') {
+// A package that installs libcumetal.dylib alongside its precompiled kernels should not also
+// have to export CUMETAL_PREBUILT_CACHE_DIR to reach them: nothing in the process knows to set
+// it, so the kernels sit on disk unused and every launch falls through to JIT, which then needs
+// a Metal compiler the target machine was explicitly packaged not to need.
+std::filesystem::path bundled_cache_root() {
+    Dl_info info{};
+    if (dladdr(reinterpret_cast<const void*>(&jit_cache_root), &info) == 0 ||
+        info.dli_fname == nullptr) {
         return {};
     }
+    const std::filesystem::path library_dir =
+        std::filesystem::path(info.dli_fname).parent_path();
+    // lib/libcumetal.dylib next to share/cumetal-cache, or the cache dropped in beside it.
+    for (const std::filesystem::path& candidate :
+         {library_dir.parent_path() / "share" / "cumetal-cache",
+          library_dir / "cumetal-cache"}) {
+        std::error_code ec;
+        if (std::filesystem::is_directory(candidate, ec) && !ec) {
+            return candidate;
+        }
+    }
+    return {};
+}
+
+std::vector<std::filesystem::path> prebuilt_cache_roots() {
     std::vector<std::filesystem::path> roots;
-    std::string_view remaining(configured);
-    while (!remaining.empty()) {
-        const std::size_t separator = remaining.find(':');
-        const std::string_view entry = remaining.substr(0, separator);
-        if (!entry.empty()) {
-            roots.emplace_back(entry);
+    const char* configured = std::getenv("CUMETAL_PREBUILT_CACHE_DIR");
+    if (configured != nullptr && configured[0] != '\0') {
+        std::string_view remaining(configured);
+        while (!remaining.empty()) {
+            const std::size_t separator = remaining.find(':');
+            const std::string_view entry = remaining.substr(0, separator);
+            if (!entry.empty()) {
+                roots.emplace_back(entry);
+            }
+            if (separator == std::string_view::npos) {
+                break;
+            }
+            remaining.remove_prefix(separator + 1);
         }
-        if (separator == std::string_view::npos) {
-            break;
-        }
-        remaining.remove_prefix(separator + 1);
+    }
+    // Searched last, so an explicit override still wins.
+    static const std::filesystem::path bundled = bundled_cache_root();
+    if (!bundled.empty()) {
+        roots.push_back(bundled);
     }
     return roots;
 }
@@ -1067,6 +1096,7 @@ bool emit_ptx_entry_to_temp_metallib(const std::string& ptx_source,
         lower_options.entry_name = kernel_name;
         lower_options.strict = true;
         lower_options.macos_deployment_target = registration_macos_deployment_target();
+        lower_options.fp64_mode = cumetal::current_fp64_mode();
         const auto lowered = cumetal::ptx::lower_ptx_to_llvm_ir(ptx_source, lower_options);
         if (!lowered.ok || lowered.llvm_ir.empty()) {
             if (!lowered.error.empty()) {
